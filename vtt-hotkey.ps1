@@ -12,6 +12,7 @@ $STOP_FILE = Join-Path $VTT_DIR "stop"
 $READY_FILE = Join-Path $VTT_DIR "ready"
 $RESULT_FILE = Join-Path $VTT_DIR "result.txt"
 $LOG_FILE = Join-Path $VTT_DIR "debug.log"
+$PID_FILE = Join-Path $VTT_DIR "hotkey.pid"
 
 if (!(Test-Path $VTT_DIR)) { New-Item -ItemType Directory -Path $VTT_DIR -Force | Out-Null }
 
@@ -21,6 +22,40 @@ function Log($msg) {
     Write-Host $line
     Add-Content -Path $LOG_FILE -Value $line
 }
+
+# --- Kill any previous VTT instance ---
+function KillPreviousInstance {
+    # Kill by PID file
+    if (Test-Path $PID_FILE) {
+        $oldPid = (Get-Content $PID_FILE).Trim()
+        if ($oldPid) {
+            try {
+                $proc = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+                if ($proc -and $proc.ProcessName -like "powershell*") {
+                    Log "Killing previous VTT instance (PID $oldPid)..."
+                    # Also kill its child python processes
+                    Get-CimInstance Win32_Process -Filter "ParentProcessId=$oldPid" -ErrorAction SilentlyContinue |
+                        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                    Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Milliseconds 500
+                }
+            } catch {}
+        }
+        Remove-Item $PID_FILE -Force -ErrorAction SilentlyContinue
+    }
+
+    # Also kill any orphaned vtt-helper daemon processes
+    Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%vtt-helper.py%daemon%'" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Log "Killing orphaned daemon (PID $($_.ProcessId))..."
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+}
+
+KillPreviousInstance
+
+# Write our PID so future instances can kill us
+Set-Content -Path $PID_FILE -Value $PID
 
 Add-Type -AssemblyName System.Windows.Forms
 
@@ -98,9 +133,24 @@ $form.ShowInTaskbar = $false
 # Ctrl+Shift = 0x0006, Enter = 0x0D
 $registered = [HotkeyForm]::RegisterHotKey($form.Handle, 1, 0x0006, 0x0D)
 if (-not $registered) {
-    Write-Host "Failed to register Ctrl+Shift+Enter hotkey. Is another instance running?"
-    if ($script:daemonProc -and -not $script:daemonProc.HasExited) { $script:daemonProc.Kill() }
-    exit 1
+    Log "ERROR: Failed to register Ctrl+Shift+Enter hotkey"
+    Log "Attempting to kill stale instances and retry..."
+    # Brute-force: kill all console powershell except us
+    Get-Process powershell -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId -and $_.Id -ne $PID } |
+        ForEach-Object {
+            Log "  Killing PowerShell PID $($_.Id)..."
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+    Start-Sleep -Milliseconds 1000
+
+    $registered = [HotkeyForm]::RegisterHotKey($form.Handle, 1, 0x0006, 0x0D)
+    if (-not $registered) {
+        Log "FATAL: Still cannot register hotkey. Exiting."
+        if ($script:daemonProc -and -not $script:daemonProc.HasExited) { $script:daemonProc.Kill() }
+        exit 1
+    }
+    Log "Hotkey registered on retry"
 }
 
 $form.Add_HotkeyPressed({
@@ -165,6 +215,7 @@ $form.Add_FormClosed({
         $script:daemonProc.Kill()
         Log "Daemon stopped"
     }
+    Remove-Item $PID_FILE -Force -ErrorAction SilentlyContinue
 })
 
 Log "=== Voice-to-Text Hotkey (Windows-native) ==="
