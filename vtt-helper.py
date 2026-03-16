@@ -8,6 +8,7 @@ import sys
 import os
 import time
 import collections
+import threading
 import numpy as np
 import sounddevice as sd
 import scipy.io.wavfile as wav
@@ -22,6 +23,7 @@ LOG_FILE = os.path.join(VTT_DIR, "helper.log")
 RATE = 16000
 CHANNELS = 1
 PRE_BUFFER_SECS = 2
+TRANSCRIBE_TIMEOUT_SECS = 30
 
 os.makedirs(VTT_DIR, exist_ok=True)
 
@@ -131,21 +133,50 @@ def daemon():
                     # Save wav (needed by faster_whisper)
                     wav.write(WAV_PATH, RATE, audio)
 
-                    # Transcribe immediately with pre-loaded model
+                    # Transcribe with timeout to prevent hanging
                     log("Transcribing...")
                     t0 = time.time()
-                    segments, info = model.transcribe(WAV_PATH, beam_size=5)
-                    text = " ".join(s.text.strip() for s in segments)
+                    result = [None, None]  # [text, info]
+                    error = [None]
+
+                    def do_transcribe():
+                        try:
+                            segments, info = model.transcribe(WAV_PATH, beam_size=5)
+                            text = " ".join(s.text.strip() for s in segments)
+                            result[0] = text
+                            result[1] = info
+                        except Exception as e:
+                            error[0] = e
+
+                    t = threading.Thread(target=do_transcribe, daemon=True)
+                    t.start()
+                    t.join(timeout=TRANSCRIBE_TIMEOUT_SECS)
+
                     elapsed = time.time() - t0
-                    log(f"Transcribed in {elapsed:.1f}s, lang={info.language}: [{text}]")
 
-                    # Write result for PowerShell to pick up
-                    with open(RESULT_FILE, "w", encoding="utf-8") as f:
-                        f.write(text)
+                    if t.is_alive():
+                        log(f"ERROR: Transcription timed out after {TRANSCRIBE_TIMEOUT_SECS}s ({duration:.1f}s audio). Writing empty result.")
+                        with open(RESULT_FILE, "w", encoding="utf-8") as f:
+                            f.write("")
+                    elif error[0]:
+                        log(f"ERROR: Transcription failed: {error[0]}")
+                        with open(RESULT_FILE, "w", encoding="utf-8") as f:
+                            f.write("")
+                    else:
+                        text = result[0] or ""
+                        info = result[1]
+                        lang = info.language if info else "?"
+                        log(f"Transcribed in {elapsed:.1f}s, lang={lang}: [{text}]")
+                        with open(RESULT_FILE, "w", encoding="utf-8") as f:
+                            f.write(text)
 
-                    # Cleanup wav
-                    if os.path.exists(WAV_PATH):
-                        os.remove(WAV_PATH)
+                    # Cleanup wav and stale signal files
+                    for cleanup_file in [WAV_PATH, START_FILE, STOP_FILE]:
+                        if os.path.exists(cleanup_file):
+                            try:
+                                os.remove(cleanup_file)
+                            except Exception:
+                                pass
                 else:
                     log("No audio captured")
                     with open(RESULT_FILE, "w") as f:

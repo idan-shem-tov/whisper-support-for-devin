@@ -114,10 +114,35 @@ Logs are written to `%TEMP%\vtt\`:
 - `debug.log` — PowerShell hotkey events
 - `helper.log` — Python daemon (recording, transcription, errors)
 
+## Management Commands
+
+Use `vtt.ps1` to manage the VTT service:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\<YourUsername>\vtt\vtt.ps1 <command>
+```
+
+| Command | Description |
+|---------|-------------|
+| `start` | Start VTT (kills any existing instance first) |
+| `stop` | Stop VTT and all daemon processes |
+| `restart` | Stop and start VTT (use this if it gets stuck) |
+| `status` | Show if VTT and its daemon are running |
+| `logs` | Show recent hotkey and daemon logs |
+
+**Tip:** If VTT stops responding to the hotkey, run `vtt.ps1 restart` to fix it.
+
+## Troubleshooting
+
+- **Hotkey not responding / "no result after 20s"**: The daemon may be stuck on a long transcription. Run `vtt.ps1 restart`.
+- **Transcription timeout**: Recordings longer than ~60s may cause the daemon to take very long to transcribe. The daemon has a 30-second transcription timeout — if exceeded, it returns an empty result and recovers automatically.
+- **Hotkey registration fails**: Another instance may be holding the hotkey. `vtt.ps1 restart` will kill stale instances first.
+
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `vtt-helper.py` | Python daemon: audio recording + Whisper transcription |
 | `vtt-hotkey.ps1` | PowerShell: global hotkey + daemon management |
+| `vtt.ps1` | CLI management tool: start, stop, restart, status, logs |
 | `install.ps1` | One-time setup: installs deps + creates startup shortcut |
