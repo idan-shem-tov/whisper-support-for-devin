@@ -59,6 +59,35 @@ def pick_device():
     return device
 
 
+def pick_language():
+    """Pick language for transcription. Returns language code or None for auto-detect."""
+    config_file = os.path.join(VTT_DIR, "language.txt")
+    if os.path.exists(config_file):
+        try:
+            lang = open(config_file).read().strip().lower()
+            if lang and lang != "auto":
+                log(f"Using configured language: {lang}")
+                return lang
+        except Exception:
+            pass
+    log("Language: auto-detect")
+    return None
+
+
+def pick_model():
+    """Pick whisper model size. Returns model name string."""
+    config_file = os.path.join(VTT_DIR, "model.txt")
+    if os.path.exists(config_file):
+        try:
+            model_name = open(config_file).read().strip().lower()
+            if model_name:
+                log(f"Using configured model: {model_name}")
+                return model_name
+        except Exception:
+            pass
+    return "base"
+
+
 def daemon():
     """Run as daemon: record with pre-buffer, transcribe with pre-loaded model.
     Flow:
@@ -73,11 +102,13 @@ def daemon():
             os.remove(f)
 
     # Pre-load the whisper model
-    log("Loading whisper model...")
+    model_name = pick_model()
+    log(f"Loading whisper model ({model_name})...")
     from faster_whisper import WhisperModel
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
     log("Model loaded")
 
+    language = pick_language()
     device = pick_device()
     pre_buffer_frames = PRE_BUFFER_SECS * RATE
     ring = collections.deque(maxlen=pre_buffer_frames)
@@ -110,7 +141,10 @@ def daemon():
 
         def do_transcribe():
             try:
-                segments, info = model.transcribe(wav_path, beam_size=5)
+                kwargs = {"beam_size": 5}
+                if language:
+                    kwargs["language"] = language
+                segments, info = model.transcribe(wav_path, **kwargs)
                 text = " ".join(s.text.strip() for s in segments)
                 transcribe_result[0] = text
                 transcribe_result[1] = info

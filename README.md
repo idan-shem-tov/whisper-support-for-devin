@@ -8,7 +8,7 @@ Global hotkey-triggered voice-to-text using [faster-whisper](https://github.com/
   - Whisper model pre-loaded in memory (no startup delay per transcription)
   - Continuous audio listening with a 2-second ring buffer (no clipped beginnings)
   - Auto-normalization of quiet microphone input
-  - Auto language detection (English, Hebrew, etc.)
+  - Auto language detection (English, Hebrew, etc.) or forced language via config
 - **PowerShell hotkey listener** (`vtt-hotkey.ps1`) handles:
   - Global Ctrl+Shift+Enter hotkey via Windows `WM_HOTKEY` messages (instant response)
   - Daemon lifecycle (auto-restart if it crashes)
@@ -95,6 +95,42 @@ If your mic is very quiet, the daemon applies automatic gain normalization.
 To boost your Windows mic volume to 100%, go to:
 **Settings > System > Sound > Input > Volume slider**
 
+## Language Configuration
+
+By default, the daemon auto-detects the spoken language. This can misfire on quiet microphones or short recordings, producing garbled output (e.g., detecting Norwegian instead of English).
+
+**Recommended:** Force a language to avoid misdetection:
+
+```
+echo en > %TEMP%\vtt\language.txt
+```
+
+Common language codes: `en` (English), `he` (Hebrew), `es` (Spanish), `fr` (French), `de` (German).
+
+To go back to auto-detection, delete the file or write `auto`:
+```
+del %TEMP%\vtt\language.txt
+```
+
+After changing, restart VTT: `vtt.ps1 restart`
+
+## Model Configuration
+
+The default model is `base` (~150MB, fast). For better accuracy on longer recordings or quiet mics, you can use a larger model:
+
+```
+echo small > %TEMP%\vtt\model.txt
+```
+
+| Model | Size | Speed | Accuracy |
+|-------|------|-------|----------|
+| `tiny` | ~75MB | Fastest | Lower |
+| `base` | ~150MB | Fast | Good (default) |
+| `small` | ~500MB | Medium | Better |
+| `medium` | ~1.5GB | Slow | High |
+
+After changing, restart VTT: `vtt.ps1 restart` (first run will download the new model).
+
 ## Changing the Hotkey
 
 Edit `vtt-hotkey.ps1`, line with `RegisterHotKey`. The modifier and key codes:
@@ -134,7 +170,8 @@ powershell -ExecutionPolicy Bypass -File C:\Users\<YourUsername>\vtt\vtt.ps1 <co
 
 ## Troubleshooting
 
-- **Hotkey not responding / "no result after 20s"**: The daemon may be stuck on a long transcription. Run `vtt.ps1 restart`.
+- **Hotkey not responding / "no result"**: The daemon may be stuck on a long transcription. Run `vtt.ps1 restart`.
+- **Garbled output / wrong language detected**: The `base` model can misdetect language on quiet mics. Fix: `echo en > %TEMP%\vtt\language.txt` and restart. See [Language Configuration](#language-configuration).
 - **Transcription timeout**: The daemon has a 120-second transcription timeout to support recordings up to ~1 minute. If exceeded, it returns an empty result and recovers automatically.
 - **Hotkey registration fails**: Another instance may be holding the hotkey. `vtt.ps1 restart` will kill stale instances first.
 
