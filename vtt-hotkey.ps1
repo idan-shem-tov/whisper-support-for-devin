@@ -177,7 +177,7 @@ $form.Add_HotkeyPressed({
 
         # Wait for result.txt (daemon writes it after transcription)
         $attempts = 0
-        while (!(Test-Path $RESULT_FILE) -and $attempts -lt 200) {
+        while (!(Test-Path $RESULT_FILE) -and $attempts -lt 1250) {
             Start-Sleep -Milliseconds 100
             $attempts++
         }
@@ -201,7 +201,7 @@ $form.Add_HotkeyPressed({
                 Log "Empty transcription."
             }
         } else {
-            Log "WARNING: no result after 20s"
+            Log "WARNING: no result after 125s"
         }
 
         $script:busy = $false

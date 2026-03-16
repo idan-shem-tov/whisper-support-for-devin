@@ -23,7 +23,7 @@ LOG_FILE = os.path.join(VTT_DIR, "helper.log")
 RATE = 16000
 CHANNELS = 1
 PRE_BUFFER_SECS = 2
-TRANSCRIBE_TIMEOUT_SECS = 30
+TRANSCRIBE_TIMEOUT_SECS = 120
 
 os.makedirs(VTT_DIR, exist_ok=True)
 
@@ -94,6 +94,73 @@ def daemon():
 
     log(f"Daemon starting, device={device}, pre-buffer={PRE_BUFFER_SECS}s")
 
+    # Transcription state (non-blocking)
+    transcribe_thread = None
+    transcribe_start_time = None
+    transcribe_result = [None, None]  # [text, info]
+    transcribe_error = [None]
+    transcribe_duration = 0.0
+
+    def start_transcribe_thread(wav_path, audio_duration):
+        nonlocal transcribe_thread, transcribe_start_time, transcribe_duration
+        transcribe_result[0] = None
+        transcribe_result[1] = None
+        transcribe_error[0] = None
+        transcribe_duration = audio_duration
+
+        def do_transcribe():
+            try:
+                segments, info = model.transcribe(wav_path, beam_size=5)
+                text = " ".join(s.text.strip() for s in segments)
+                transcribe_result[0] = text
+                transcribe_result[1] = info
+            except Exception as e:
+                transcribe_error[0] = e
+
+        transcribe_thread = threading.Thread(target=do_transcribe, daemon=True)
+        transcribe_start_time = time.time()
+        transcribe_thread.start()
+
+    def check_transcribe_done():
+        """Check if background transcription finished. Returns True if done/timed out."""
+        nonlocal transcribe_thread, transcribe_start_time
+        if transcribe_thread is None:
+            return True
+        if not transcribe_thread.is_alive():
+            elapsed = time.time() - transcribe_start_time
+            if transcribe_error[0]:
+                log(f"ERROR: Transcription failed: {transcribe_error[0]}")
+                with open(RESULT_FILE, "w", encoding="utf-8") as f:
+                    f.write("")
+            else:
+                text = transcribe_result[0] or ""
+                info = transcribe_result[1]
+                lang = info.language if info else "?"
+                log(f"Transcribed in {elapsed:.1f}s, lang={lang}: [{text}]")
+                with open(RESULT_FILE, "w", encoding="utf-8") as f:
+                    f.write(text)
+            cleanup_after_transcribe()
+            return True
+        # Check timeout
+        if time.time() - transcribe_start_time > TRANSCRIBE_TIMEOUT_SECS:
+            log(f"ERROR: Transcription timed out after {TRANSCRIBE_TIMEOUT_SECS}s ({transcribe_duration:.1f}s audio). Writing empty result.")
+            with open(RESULT_FILE, "w", encoding="utf-8") as f:
+                f.write("")
+            cleanup_after_transcribe()
+            return True
+        return False
+
+    def cleanup_after_transcribe():
+        nonlocal transcribe_thread, transcribe_start_time
+        transcribe_thread = None
+        transcribe_start_time = None
+        for cleanup_file in [WAV_PATH, START_FILE, STOP_FILE]:
+            if os.path.exists(cleanup_file):
+                try:
+                    os.remove(cleanup_file)
+                except Exception:
+                    pass
+
     with sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype="int16",
                         callback=callback, device=device):
         # Signal that we're ready
@@ -101,7 +168,19 @@ def daemon():
         log("Daemon ready, waiting for signals...")
 
         while True:
-            if not is_recording and os.path.exists(START_FILE):
+            # Check if a background transcription finished
+            is_transcribing = not check_transcribe_done()
+
+            if is_transcribing:
+                # Drain any signal files created while we're busy
+                for f in [START_FILE, STOP_FILE]:
+                    if os.path.exists(f):
+                        try:
+                            os.remove(f)
+                        except Exception:
+                            pass
+
+            elif not is_recording and os.path.exists(START_FILE):
                 os.remove(START_FILE)
                 if os.path.exists(RESULT_FILE):
                     os.remove(RESULT_FILE)
@@ -133,50 +212,9 @@ def daemon():
                     # Save wav (needed by faster_whisper)
                     wav.write(WAV_PATH, RATE, audio)
 
-                    # Transcribe with timeout to prevent hanging
+                    # Start non-blocking transcription
                     log("Transcribing...")
-                    t0 = time.time()
-                    result = [None, None]  # [text, info]
-                    error = [None]
-
-                    def do_transcribe():
-                        try:
-                            segments, info = model.transcribe(WAV_PATH, beam_size=5)
-                            text = " ".join(s.text.strip() for s in segments)
-                            result[0] = text
-                            result[1] = info
-                        except Exception as e:
-                            error[0] = e
-
-                    t = threading.Thread(target=do_transcribe, daemon=True)
-                    t.start()
-                    t.join(timeout=TRANSCRIBE_TIMEOUT_SECS)
-
-                    elapsed = time.time() - t0
-
-                    if t.is_alive():
-                        log(f"ERROR: Transcription timed out after {TRANSCRIBE_TIMEOUT_SECS}s ({duration:.1f}s audio). Writing empty result.")
-                        with open(RESULT_FILE, "w", encoding="utf-8") as f:
-                            f.write("")
-                    elif error[0]:
-                        log(f"ERROR: Transcription failed: {error[0]}")
-                        with open(RESULT_FILE, "w", encoding="utf-8") as f:
-                            f.write("")
-                    else:
-                        text = result[0] or ""
-                        info = result[1]
-                        lang = info.language if info else "?"
-                        log(f"Transcribed in {elapsed:.1f}s, lang={lang}: [{text}]")
-                        with open(RESULT_FILE, "w", encoding="utf-8") as f:
-                            f.write(text)
-
-                    # Cleanup wav and stale signal files
-                    for cleanup_file in [WAV_PATH, START_FILE, STOP_FILE]:
-                        if os.path.exists(cleanup_file):
-                            try:
-                                os.remove(cleanup_file)
-                            except Exception:
-                                pass
+                    start_transcribe_thread(WAV_PATH, duration)
                 else:
                     log("No audio captured")
                     with open(RESULT_FILE, "w") as f:

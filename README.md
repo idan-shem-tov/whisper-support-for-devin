@@ -135,7 +135,7 @@ powershell -ExecutionPolicy Bypass -File C:\Users\<YourUsername>\vtt\vtt.ps1 <co
 ## Troubleshooting
 
 - **Hotkey not responding / "no result after 20s"**: The daemon may be stuck on a long transcription. Run `vtt.ps1 restart`.
-- **Transcription timeout**: Recordings longer than ~60s may cause the daemon to take very long to transcribe. The daemon has a 30-second transcription timeout — if exceeded, it returns an empty result and recovers automatically.
+- **Transcription timeout**: The daemon has a 120-second transcription timeout to support recordings up to ~1 minute. If exceeded, it returns an empty result and recovers automatically.
 - **Hotkey registration fails**: Another instance may be holding the hotkey. `vtt.ps1 restart` will kill stale instances first.
 
 ## Files
