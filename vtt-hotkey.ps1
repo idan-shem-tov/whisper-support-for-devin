@@ -163,6 +163,10 @@ $form.Add_HotkeyPressed({
     if (-not $script:recording) {
         # --- START RECORDING ---
         EnsureDaemon
+        # Clean up stale files from any previous failed cycle
+        foreach ($f in @($RESULT_FILE, $STOP_FILE, $START_FILE)) {
+            Remove-Item $f -Force -ErrorAction SilentlyContinue
+        }
         Log "Recording..."
         New-Item -ItemType File -Path $START_FILE -Force | Out-Null
         $script:recording = $true
@@ -202,6 +206,11 @@ $form.Add_HotkeyPressed({
             }
         } else {
             Log "WARNING: no result after 125s"
+        }
+
+        # Always clean up after cycle (success or timeout) so next cycle starts fresh
+        foreach ($f in @($START_FILE, $STOP_FILE, $RESULT_FILE)) {
+            Remove-Item $f -Force -ErrorAction SilentlyContinue
         }
 
         $script:busy = $false

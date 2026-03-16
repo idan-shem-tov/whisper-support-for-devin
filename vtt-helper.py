@@ -216,8 +216,13 @@ def daemon():
 
             elif not is_recording and os.path.exists(START_FILE):
                 os.remove(START_FILE)
-                if os.path.exists(RESULT_FILE):
-                    os.remove(RESULT_FILE)
+                # Clean up stale files from any previous failed cycle
+                for stale in [RESULT_FILE, STOP_FILE]:
+                    if os.path.exists(stale):
+                        try:
+                            os.remove(stale)
+                        except Exception:
+                            pass
                 recording_chunks.clear()
                 recording_chunks.append(np.array(list(ring), dtype=np.int16))
                 is_recording = True
