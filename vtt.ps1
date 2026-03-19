@@ -87,16 +87,15 @@ function Start-Vtt {
     }
     Write-Host "Starting VTT..." -ForegroundColor Cyan
     Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$HOTKEY_SCRIPT`"" -WindowStyle Hidden
-    Start-Sleep -Milliseconds 2000
 
-    # Wait for PID file
+    # Wait for port file (means daemon is loaded and hotkey is registered)
     $waited = 0
-    while (!(Test-Path $PID_FILE) -and $waited -lt 30) {
+    while (!(Test-Path $PORT_FILE) -and $waited -lt 60) {
         Start-Sleep -Milliseconds 500
         $waited++
     }
 
-    if (Is-Running) {
+    if ((Test-Path $PORT_FILE) -and (Is-Running)) {
         Write-Host "VTT started (PID $(Get-VttPid))" -ForegroundColor Green
         Write-Host "Hotkey: Ctrl+Shift+Enter" -ForegroundColor Cyan
     } else {

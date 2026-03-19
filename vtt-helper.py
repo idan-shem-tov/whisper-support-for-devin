@@ -25,7 +25,6 @@ LOG_FILE = os.path.join(VTT_DIR, "helper.log")
 RATE = 16000
 CHANNELS = 1
 PRE_BUFFER_SECS = 2
-TRANSCRIBE_TIMEOUT_SECS = 120
 
 # Audio feedback sounds (played async so they don't block recording)
 SND_START = r"C:\Windows\Media\Speech On.wav"
@@ -44,8 +43,12 @@ os.makedirs(VTT_DIR, exist_ok=True)
 def log(msg):
     ts = time.strftime("%H:%M:%S")
     line = f"{ts} {msg}"
-    print(line, file=sys.stderr, flush=True)
-    with open(LOG_FILE, "a") as f:
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        print(line.encode("utf-8", errors="replace").decode("ascii", errors="replace"),
+              file=sys.stderr, flush=True)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
@@ -145,6 +148,7 @@ def daemon():
 
     def do_transcribe_bg(wav_path):
         """Transcribe in background thread, store result."""
+        text = ""
         try:
             kwargs = {"beam_size": 5}
             if language:
@@ -153,13 +157,15 @@ def daemon():
             text = " ".join(s.text.strip() for s in segments)
             lang = info.language if info else "?"
             log(f"Transcribed ({lang}): [{text}]")
+        except Exception as e:
+            try:
+                log(f"ERROR: Transcription failed: {e}")
+            except Exception:
+                pass  # log() itself failed, but we still have text if it was set
+        finally:
+            # ALWAYS set the result so PS side never gets stuck on "pending"
             with transcription_lock:
                 transcription_result[0] = text
-        except Exception as e:
-            log(f"ERROR: Transcription failed: {e}")
-            with transcription_lock:
-                transcription_result[0] = ""
-        finally:
             try:
                 os.remove(wav_path)
             except Exception:
@@ -232,7 +238,8 @@ def daemon():
         # Got a result — reset state and return it
         with transcription_lock:
             transcription_result[0] = None
-        return val
+        # Sanitize: replace newlines so TCP line-based protocol isn't broken
+        return val.replace("\n", " ").replace("\r", "")
 
     def handle_client(conn):
         """Handle a single client connection."""

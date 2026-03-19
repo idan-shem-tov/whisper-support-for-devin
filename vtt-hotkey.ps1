@@ -23,6 +23,7 @@ function Log($msg) {
 
 # --- TCP client: send a command to the daemon, return the response ---
 function Send-DaemonCommand($cmd, $timeoutMs = 130000) {
+    $client = $null
     try {
         if (!(Test-Path $PORT_FILE)) { return $null }
         $port = [int](Get-Content $PORT_FILE).Trim()
@@ -35,10 +36,11 @@ function Send-DaemonCommand($cmd, $timeoutMs = 130000) {
         $writer.WriteLine($cmd)
         $writer.Flush()
         $response = $reader.ReadLine()
-        $client.Close()
         return $response
     } catch {
         return $null
+    } finally {
+        if ($client) { $client.Close() }
     }
 }
 
@@ -194,7 +196,16 @@ if (-not $registered) {
 # --- Result polling timer (non-blocking, keeps message pump alive) ---
 $script:resultTimer = New-Object System.Windows.Forms.Timer
 $script:resultTimer.Interval = 200
+$script:resultPollCount = 0
 $script:resultTimer.Add_Tick({
+    $script:resultPollCount++
+    # Safety timeout: bail after 120 seconds (600 ticks * 200ms)
+    if ($script:resultPollCount -gt 600) {
+        $script:resultTimer.Stop()
+        Log "WARNING: transcription timed out after 120s"
+        $script:busy = $false
+        return
+    }
     $text = Send-DaemonCommand "result" 2000
     if ($text -eq $null) {
         # Connection failed = daemon died
@@ -259,6 +270,7 @@ $form.Add_HotkeyPressed({
         }
 
         # Start polling for result (non-blocking timer keeps UI responsive)
+        $script:resultPollCount = 0
         $script:resultTimer.Start()
     }
 })
