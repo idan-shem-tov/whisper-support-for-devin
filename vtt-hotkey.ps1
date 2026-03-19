@@ -191,6 +191,36 @@ if (-not $registered) {
     Log "Hotkey registered on retry"
 }
 
+# --- Result polling timer (non-blocking, keeps message pump alive) ---
+$script:resultTimer = New-Object System.Windows.Forms.Timer
+$script:resultTimer.Interval = 200
+$script:resultTimer.Add_Tick({
+    $text = Send-DaemonCommand "result" 2000
+    if ($text -eq $null) {
+        # Connection failed = daemon died
+        $script:resultTimer.Stop()
+        Log "WARNING: daemon died during transcription, restarting..."
+        StartDaemon
+        $script:busy = $false
+        return
+    }
+    if ($text -eq "pending") { return }  # still transcribing, keep polling
+
+    # Transcription done
+    $script:resultTimer.Stop()
+    if ($text.Length -gt 0) {
+        Log "  result: [$text]"
+        [System.Windows.Forms.Clipboard]::SetText($text)
+        Log ">>> $text"
+        Start-Sleep -Milliseconds 200
+        [HotkeyForm]::PasteFromClipboard()
+        Log "(pasted)"
+    } else {
+        Log "Empty transcription."
+    }
+    $script:busy = $false
+})
+
 $form.Add_HotkeyPressed({
     # Ignore hotkey while busy processing a transcription
     if ($script:busy) {
@@ -219,25 +249,17 @@ $form.Add_HotkeyPressed({
         $script:recording = $false
         $script:busy = $true
 
-        # Send stop command — blocks until transcription is done (up to 130s)
-        $text = Send-DaemonCommand "stop"
-
-        if ($text -eq $null) {
-            # Connection failed = daemon died
-            Log "WARNING: daemon died during transcription, restarting..."
+        # Send stop — returns immediately, transcription runs in background
+        $stopResult = Send-DaemonCommand "stop" 5000
+        if ($stopResult -eq $null) {
+            Log "WARNING: daemon not responding, restarting..."
             StartDaemon
-        } elseif ($text.Length -gt 0) {
-            Log "  result: [$text]"
-            [System.Windows.Forms.Clipboard]::SetText($text)
-            Log ">>> $text"
-            Start-Sleep -Milliseconds 200
-            [HotkeyForm]::PasteFromClipboard()
-            Log "(pasted)"
-        } else {
-            Log "Empty transcription."
+            $script:busy = $false
+            return
         }
 
-        $script:busy = $false
+        # Start polling for result (non-blocking timer keeps UI responsive)
+        $script:resultTimer.Start()
     }
 })
 

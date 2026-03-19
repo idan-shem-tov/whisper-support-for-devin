@@ -108,7 +108,7 @@ def pick_device():
 def daemon():
     """Run as daemon: record with pre-buffer, transcribe with pre-loaded model.
     Uses a TCP server on localhost for IPC with the hotkey script.
-    Commands: start, stop, ping
+    Commands: start, stop, result, ping
     """
     # Load config
     config = load_config()
@@ -129,6 +129,10 @@ def daemon():
     is_recording = False
     lock = threading.Lock()  # protects is_recording and recording_chunks
 
+    # Transcription state (background thread writes result here)
+    transcription_result = [None]  # None=idle, "pending"=working, str=done
+    transcription_lock = threading.Lock()
+
     def callback(indata, frames, time_info, status):
         samples = indata[:, 0].copy()
         with lock:
@@ -139,8 +143,8 @@ def daemon():
 
     log(f"Daemon starting, device={device}, pre-buffer={PRE_BUFFER_SECS}s")
 
-    def do_transcribe(wav_path):
-        """Transcribe a WAV file synchronously. Returns (text, language)."""
+    def do_transcribe_bg(wav_path):
+        """Transcribe in background thread, store result."""
         try:
             kwargs = {"beam_size": 5}
             if language:
@@ -148,10 +152,18 @@ def daemon():
             segments, info = model.transcribe(wav_path, **kwargs)
             text = " ".join(s.text.strip() for s in segments)
             lang = info.language if info else "?"
-            return text, lang
+            log(f"Transcribed ({lang}): [{text}]")
+            with transcription_lock:
+                transcription_result[0] = text
         except Exception as e:
             log(f"ERROR: Transcription failed: {e}")
-            return "", "?"
+            with transcription_lock:
+                transcription_result[0] = ""
+        finally:
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
 
     def handle_start():
         """Handle 'start' command: begin recording."""
@@ -168,11 +180,11 @@ def daemon():
         return "ok"
 
     def handle_stop():
-        """Handle 'stop' command: stop recording, transcribe, return result."""
+        """Handle 'stop' command: stop recording, start transcription in background."""
         nonlocal is_recording
         with lock:
             if not is_recording:
-                return ""
+                return "ok"
             is_recording = False
             chunks = list(recording_chunks)
             recording_chunks.clear()
@@ -182,7 +194,9 @@ def daemon():
 
         if not chunks:
             log("No audio captured")
-            return ""
+            with transcription_lock:
+                transcription_result[0] = ""
+            return "ok"
 
         audio = np.concatenate(chunks)
         peak = int(np.max(np.abs(audio)))
@@ -198,22 +212,27 @@ def daemon():
             audio = np.clip(audio_float, -32767, 32767).astype(np.int16)
             log(f"Applied {gain:.1f}x gain")
 
-        # Save wav (needed by faster_whisper)
+        # Save wav and start background transcription
         wav.write(WAV_PATH, RATE, audio)
-
-        # Transcribe synchronously (blocks until done)
+        with transcription_lock:
+            transcription_result[0] = "pending"
         log("Transcribing...")
-        text, lang = do_transcribe(WAV_PATH)
-        elapsed = duration  # approximate
-        log(f"Transcribed ({lang}): [{text}]")
+        t = threading.Thread(target=do_transcribe_bg, args=(WAV_PATH,), daemon=True)
+        t.start()
+        return "ok"
 
-        # Clean up wav
-        try:
-            os.remove(WAV_PATH)
-        except Exception:
-            pass
-
-        return text
+    def handle_result():
+        """Handle 'result' command: return transcription result or 'pending'."""
+        with transcription_lock:
+            val = transcription_result[0]
+        if val is None:
+            return ""
+        if val == "pending":
+            return "pending"
+        # Got a result — reset state and return it
+        with transcription_lock:
+            transcription_result[0] = None
+        return val
 
     def handle_client(conn):
         """Handle a single client connection."""
@@ -229,6 +248,9 @@ def daemon():
                 conn.sendall(f"{result}\n".encode("utf-8"))
             elif data == "stop":
                 result = handle_stop()
+                conn.sendall(f"{result}\n".encode("utf-8"))
+            elif data == "result":
+                result = handle_result()
                 conn.sendall(f"{result}\n".encode("utf-8"))
             else:
                 conn.sendall(b"error: unknown command\n")
