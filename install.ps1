@@ -61,7 +61,7 @@ if (!(Test-Path $configPath)) {
 model = base
 
 # Language: auto (auto-detect), en, he, es, fr, de, etc.
-language = auto
+language = en
 
 # Sound feedback on start/stop recording: on or off
 sound = on

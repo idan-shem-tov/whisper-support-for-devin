@@ -40,7 +40,7 @@ Edit **`config.ini`** and restart VTT for changes to take effect.
 model = base
 
 # Language: auto, en, he, es, fr, de, etc.
-language = auto
+language = en
 
 # Sound feedback on start/stop: on or off
 sound = on
