@@ -8,12 +8,16 @@ import sys
 import os
 import time
 import collections
+import configparser
 import threading
+import winsound
 import numpy as np
 import sounddevice as sd
 import scipy.io.wavfile as wav
 
 VTT_DIR = os.path.join(os.environ.get("TEMP", r"C:\Temp"), "vtt")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.ini")
 WAV_PATH = os.path.join(VTT_DIR, "recording.wav")
 START_FILE = os.path.join(VTT_DIR, "start")
 STOP_FILE = os.path.join(VTT_DIR, "stop")
@@ -24,6 +28,17 @@ RATE = 16000
 CHANNELS = 1
 PRE_BUFFER_SECS = 2
 TRANSCRIBE_TIMEOUT_SECS = 120
+
+# Audio feedback sounds (played async so they don't block recording)
+SND_START = r"C:\Windows\Media\Speech On.wav"
+SND_STOP  = r"C:\Windows\Media\Speech Off.wav"
+
+def play_sound(path):
+    """Play a WAV file asynchronously (non-blocking)."""
+    try:
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+    except Exception:
+        pass
 
 os.makedirs(VTT_DIR, exist_ok=True)
 
@@ -36,17 +51,50 @@ def log(msg):
         f.write(line + "\n")
 
 
-def pick_device():
-    """Pick the best input device."""
-    config_file = os.path.join(VTT_DIR, "device.txt")
-    if os.path.exists(config_file):
-        try:
-            device = int(open(config_file).read().strip())
-            log(f"Using saved device {device}")
-            return device
-        except Exception:
-            pass
+def load_config():
+    """Load all settings from config.ini. Returns a dict with keys:
+    model (str), language (str or None), sound (bool).
+    """
+    defaults = {"model": "base", "language": None, "sound": True}
 
+    if not os.path.exists(CONFIG_FILE):
+        log(f"No config.ini found at {CONFIG_FILE}, using defaults")
+        return defaults
+
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG_FILE, encoding="utf-8")
+
+    if not cfg.has_section("vtt"):
+        log("config.ini has no [vtt] section, using defaults")
+        return defaults
+
+    result = dict(defaults)
+
+    # Model
+    val = cfg.get("vtt", "model", fallback="base").strip().lower()
+    if val:
+        result["model"] = val
+    log(f"Config: model={result['model']}")
+
+    # Language
+    val = cfg.get("vtt", "language", fallback="auto").strip().lower()
+    if val and val != "auto":
+        result["language"] = val
+        log(f"Config: language={val}")
+    else:
+        result["language"] = None
+        log("Config: language=auto-detect")
+
+    # Sound
+    val = cfg.get("vtt", "sound", fallback="on").strip().lower()
+    result["sound"] = val in ("on", "true", "yes", "1")
+    log(f"Config: sound={'on' if result['sound'] else 'off'}")
+
+    return result
+
+
+def pick_device():
+    """Auto-detect the best input device."""
     devices = sd.query_devices()
     for i, d in enumerate(devices):
         api_name = sd.query_hostapis(d['hostapi'])['name']
@@ -57,35 +105,6 @@ def pick_device():
     device = sd.default.device[0]
     log(f"Using default input device {device}")
     return device
-
-
-def pick_language():
-    """Pick language for transcription. Returns language code or None for auto-detect."""
-    config_file = os.path.join(VTT_DIR, "language.txt")
-    if os.path.exists(config_file):
-        try:
-            lang = open(config_file).read().strip().lower()
-            if lang and lang != "auto":
-                log(f"Using configured language: {lang}")
-                return lang
-        except Exception:
-            pass
-    log("Language: auto-detect")
-    return None
-
-
-def pick_model():
-    """Pick whisper model size. Returns model name string."""
-    config_file = os.path.join(VTT_DIR, "model.txt")
-    if os.path.exists(config_file):
-        try:
-            model_name = open(config_file).read().strip().lower()
-            if model_name:
-                log(f"Using configured model: {model_name}")
-                return model_name
-        except Exception:
-            pass
-    return "base"
 
 
 def daemon():
@@ -101,14 +120,18 @@ def daemon():
         if os.path.exists(f):
             os.remove(f)
 
+    # Load config
+    config = load_config()
+    sound_enabled = config["sound"]
+
     # Pre-load the whisper model
-    model_name = pick_model()
+    model_name = config["model"]
     log(f"Loading whisper model ({model_name})...")
     from faster_whisper import WhisperModel
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
     log("Model loaded")
 
-    language = pick_language()
+    language = config["language"]
     device = pick_device()
     pre_buffer_frames = PRE_BUFFER_SECS * RATE
     ring = collections.deque(maxlen=pre_buffer_frames)
@@ -201,65 +224,82 @@ def daemon():
         open(READY_FILE, "w").close()
         log("Daemon ready, waiting for signals...")
 
-        while True:
-            # Check if a background transcription finished
-            is_transcribing = not check_transcribe_done()
+        try:
+            while True:
+                # Check if a background transcription finished
+                is_transcribing = not check_transcribe_done()
 
-            if is_transcribing:
-                # Drain any signal files created while we're busy
-                for f in [START_FILE, STOP_FILE]:
-                    if os.path.exists(f):
-                        try:
-                            os.remove(f)
-                        except Exception:
-                            pass
+                if is_transcribing:
+                    # Drain any signal files created while we're busy
+                    for f in [START_FILE, STOP_FILE]:
+                        if os.path.exists(f):
+                            try:
+                                os.remove(f)
+                            except Exception:
+                                pass
 
-            elif not is_recording and os.path.exists(START_FILE):
-                os.remove(START_FILE)
-                # Clean up stale files from any previous failed cycle
-                for stale in [RESULT_FILE, STOP_FILE]:
-                    if os.path.exists(stale):
-                        try:
-                            os.remove(stale)
-                        except Exception:
-                            pass
-                recording_chunks.clear()
-                recording_chunks.append(np.array(list(ring), dtype=np.int16))
-                is_recording = True
-                log(f"Recording started (pre-buffer={len(ring)} samples)")
-
-            elif is_recording and os.path.exists(STOP_FILE):
-                os.remove(STOP_FILE)
-                is_recording = False
-
-                if recording_chunks:
-                    audio = np.concatenate(recording_chunks)
-                    peak = int(np.max(np.abs(audio)))
-                    rms = float(np.sqrt(np.mean(audio.astype(float)**2)))
-                    duration = len(audio) / RATE
-                    log(f"Recording stopped: {duration:.1f}s, peak={peak}, rms={rms:.0f}")
+                elif not is_recording and os.path.exists(START_FILE):
+                    os.remove(START_FILE)
+                    # Clean up stale files from any previous failed cycle
+                    for stale in [RESULT_FILE, STOP_FILE]:
+                        if os.path.exists(stale):
+                            try:
+                                os.remove(stale)
+                            except Exception:
+                                pass
                     recording_chunks.clear()
+                    recording_chunks.append(np.array(list(ring), dtype=np.int16))
+                    is_recording = True
+                    if sound_enabled:
+                        play_sound(SND_START)
+                    log(f"Recording started (pre-buffer={len(ring)} samples)")
 
-                    # Normalize audio
-                    if peak > 10:
-                        target = 26000
-                        gain = min(target / peak, 200)
-                        audio_float = audio.astype(np.float64) * gain
-                        audio = np.clip(audio_float, -32767, 32767).astype(np.int16)
-                        log(f"Applied {gain:.1f}x gain")
+                elif is_recording and os.path.exists(STOP_FILE):
+                    os.remove(STOP_FILE)
+                    is_recording = False
+                    if sound_enabled:
+                        play_sound(SND_STOP)
 
-                    # Save wav (needed by faster_whisper)
-                    wav.write(WAV_PATH, RATE, audio)
+                    if recording_chunks:
+                        audio = np.concatenate(recording_chunks)
+                        peak = int(np.max(np.abs(audio)))
+                        rms = float(np.sqrt(np.mean(audio.astype(float)**2)))
+                        duration = len(audio) / RATE
+                        log(f"Recording stopped: {duration:.1f}s, peak={peak}, rms={rms:.0f}")
+                        recording_chunks.clear()
 
-                    # Start non-blocking transcription
-                    log("Transcribing...")
-                    start_transcribe_thread(WAV_PATH, duration)
-                else:
-                    log("No audio captured")
-                    with open(RESULT_FILE, "w") as f:
-                        f.write("")
+                        # Normalize audio
+                        if peak > 10:
+                            target = 26000
+                            gain = min(target / peak, 200)
+                            audio_float = audio.astype(np.float64) * gain
+                            audio = np.clip(audio_float, -32767, 32767).astype(np.int16)
+                            log(f"Applied {gain:.1f}x gain")
 
-            time.sleep(0.05)
+                        # Save wav (needed by faster_whisper)
+                        wav.write(WAV_PATH, RATE, audio)
+
+                        # Start non-blocking transcription
+                        log("Transcribing...")
+                        start_transcribe_thread(WAV_PATH, duration)
+                    else:
+                        log("No audio captured")
+                        with open(RESULT_FILE, "w") as f:
+                            f.write("")
+
+                time.sleep(0.05)
+        except Exception as e:
+            log(f"FATAL: Main loop error: {e}")
+            # Clean up so PS side doesn't hang waiting
+            is_recording = False
+            recording_chunks.clear()
+            for f in [READY_FILE, START_FILE, STOP_FILE]:
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+            raise
 
 
 def test_mic():
@@ -281,7 +321,7 @@ def test_mic():
         except Exception as e:
             name = d['name'][:40]
             print(f"  [{i:2d}] ERROR  {name}: {e}")
-    print(f"\nTo set a specific device, write its number to: {VTT_DIR}\\device.txt")
+    print(f"\nDefault device is auto-detected. Edit config.ini to change other settings.")
 
 
 if __name__ == "__main__":

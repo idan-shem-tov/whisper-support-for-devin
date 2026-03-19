@@ -79,48 +79,23 @@ Or run the included install script:
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-## Microphone Configuration
+## Configuration
 
-The daemon auto-selects the "Microphone Array" device (built-in laptop mic). If you want a specific device:
+All settings are in **`config.ini`** (in the VTT folder). Edit it with any text editor and restart VTT for changes to take effect.
 
-1. Run: `python vtt-helper.py test-mic` (speak while it tests)
-2. Note the device number that shows "GOOD"
-3. Write that number to `%TEMP%\vtt\device.txt`:
-   ```
-   echo 2 > %TEMP%\vtt\device.txt
-   ```
+```ini
+[vtt]
+# Whisper model: tiny, base, small, medium
+model = base
 
-If your mic is very quiet, the daemon applies automatic gain normalization.
+# Language: auto (auto-detect), en, he, es, fr, de, etc.
+language = auto
 
-To boost your Windows mic volume to 100%, go to:
-**Settings > System > Sound > Input > Volume slider**
-
-## Language Configuration
-
-By default, the daemon auto-detects the spoken language. This can misfire on quiet microphones or short recordings, producing garbled output (e.g., detecting Norwegian instead of English).
-
-**Recommended:** Force a language to avoid misdetection:
-
-```
-echo en > %TEMP%\vtt\language.txt
+# Sound feedback on start/stop recording: on or off
+sound = on
 ```
 
-Common language codes: `en` (English), `he` (Hebrew), `es` (Spanish), `fr` (French), `de` (German).
-
-To go back to auto-detection, delete the file or write `auto`:
-```
-del %TEMP%\vtt\language.txt
-```
-
-After changing, restart VTT: `vtt.ps1 restart`
-
-## Model Configuration
-
-The default model is `base` (~150MB, fast). For better accuracy on longer recordings or quiet mics, you can use a larger model:
-
-```
-echo small > %TEMP%\vtt\model.txt
-```
+### Model
 
 | Model | Size | Speed | Accuracy |
 |-------|------|-------|----------|
@@ -129,7 +104,23 @@ echo small > %TEMP%\vtt\model.txt
 | `small` | ~500MB | Medium | Better |
 | `medium` | ~1.5GB | Slow | High |
 
-After changing, restart VTT: `vtt.ps1 restart` (first run will download the new model).
+First run with a new model will download it from Hugging Face.
+
+### Language
+
+Common codes: `en` (English), `he` (Hebrew), `es` (Spanish), `fr` (French), `de` (German).
+
+**Recommended:** Set a specific language to avoid misdetection on quiet mics or short recordings.
+
+### Sound Feedback
+
+Set `sound = on` to hear audio cues when recording starts/stops. Set `sound = off` for silent operation.
+
+### Microphone
+
+The daemon auto-detects the best microphone. If your mic is very quiet, the daemon applies automatic gain normalization. To boost your Windows mic volume to 100%, go to: **Settings > System > Sound > Input > Volume slider**
+
+After any change, restart VTT: `vtt.ps1 restart`
 
 ## Changing the Hotkey
 
@@ -171,7 +162,7 @@ powershell -ExecutionPolicy Bypass -File C:\Users\<YourUsername>\vtt\vtt.ps1 <co
 ## Troubleshooting
 
 - **Hotkey not responding / "no result"**: The daemon may be stuck on a long transcription. Run `vtt.ps1 restart`.
-- **Garbled output / wrong language detected**: The `base` model can misdetect language on quiet mics. Fix: `echo en > %TEMP%\vtt\language.txt` and restart. See [Language Configuration](#language-configuration).
+- **Garbled output / wrong language detected**: The `base` model can misdetect language on quiet mics. Fix: set `language = en` in `config.ini` and restart. See [Configuration](#configuration).
 - **Transcription timeout**: The daemon has a 120-second transcription timeout to support recordings up to ~1 minute. If exceeded, it returns an empty result and recovers automatically.
 - **Hotkey registration fails**: Another instance may be holding the hotkey. `vtt.ps1 restart` will kill stale instances first.
 
@@ -179,6 +170,7 @@ powershell -ExecutionPolicy Bypass -File C:\Users\<YourUsername>\vtt\vtt.ps1 <co
 
 | File | Purpose |
 |------|---------|
+| `config.ini` | All settings: model, language, sound |
 | `vtt-helper.py` | Python daemon: audio recording + Whisper transcription |
 | `vtt-hotkey.ps1` | PowerShell: global hotkey + daemon management |
 | `vtt.ps1` | CLI management tool: start, stop, restart, status, logs |

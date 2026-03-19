@@ -59,7 +59,7 @@ Set-Content -Path $PID_FILE -Value $PID
 
 Add-Type -AssemblyName System.Windows.Forms
 
-# WM_HOTKEY-aware form
+# WM_HOTKEY-aware form with keybd_event paste (works in terminals unlike SendKeys)
 Add-Type -ReferencedAssemblies System.Windows.Forms @"
 using System;
 using System.Windows.Forms;
@@ -73,6 +73,20 @@ public class HotkeyForm : Form {
     public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll")]
     public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    private const byte VK_CONTROL = 0x11;
+    private const byte VK_V = 0x56;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+
+    public static void PasteFromClipboard() {
+        keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
+        keybd_event(VK_V, 0, 0, UIntPtr.Zero);
+        keybd_event(VK_V, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+    }
 
     protected override void WndProc(ref Message m) {
         if (m.Msg == WM_HOTKEY) {
@@ -134,13 +148,16 @@ $form.ShowInTaskbar = $false
 $registered = [HotkeyForm]::RegisterHotKey($form.Handle, 1, 0x0006, 0x0D)
 if (-not $registered) {
     Log "ERROR: Failed to register Ctrl+Shift+Enter hotkey"
-    Log "Attempting to kill stale instances and retry..."
-    # Brute-force: kill all console powershell except us
-    Get-Process powershell -ErrorAction SilentlyContinue |
-        Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId -and $_.Id -ne $PID } |
+    Log "Attempting to kill stale VTT instances and retry..."
+    # Targeted: only kill PowerShell processes running vtt-hotkey.ps1 (not unrelated PS sessions)
+    Get-CimInstance Win32_Process -Filter "Name LIKE 'powershell%'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*vtt-hotkey.ps1*" } |
         ForEach-Object {
-            Log "  Killing PowerShell PID $($_.Id)..."
-            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+            Log "  Killing stale VTT instance PID $($_.ProcessId)..."
+            # Kill its child processes (daemon) first
+            Get-CimInstance Win32_Process -Filter "ParentProcessId=$($_.ProcessId)" -ErrorAction SilentlyContinue |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         }
     Start-Sleep -Milliseconds 1000
 
@@ -176,14 +193,32 @@ $form.Add_HotkeyPressed({
         $script:recording = $false
         $script:busy = $true
 
+        # Check if daemon is alive before waiting for a result
+        if ($script:daemonProc -eq $null -or $script:daemonProc.HasExited) {
+            Log "WARNING: daemon died during recording, restarting..."
+            StartDaemon
+            foreach ($f in @($START_FILE, $STOP_FILE, $RESULT_FILE)) {
+                Remove-Item $f -Force -ErrorAction SilentlyContinue
+            }
+            $script:busy = $false
+            return
+        }
+
         # Signal stop
         New-Item -ItemType File -Path $STOP_FILE -Force | Out-Null
 
         # Wait for result.txt (daemon writes it after transcription)
+        # Also check daemon health periodically to bail early if it dies
         $attempts = 0
         while (!(Test-Path $RESULT_FILE) -and $attempts -lt 1250) {
             Start-Sleep -Milliseconds 100
             $attempts++
+            # Every 2 seconds, check if daemon is still alive
+            if ($attempts % 20 -eq 0 -and $script:daemonProc.HasExited) {
+                Log "WARNING: daemon died while transcribing, restarting..."
+                StartDaemon
+                break
+            }
         }
 
         if (Test-Path $RESULT_FILE) {
@@ -199,13 +234,13 @@ $form.Add_HotkeyPressed({
                 [System.Windows.Forms.Clipboard]::SetText($text)
                 Log ">>> $text"
                 Start-Sleep -Milliseconds 200
-                [System.Windows.Forms.SendKeys]::SendWait("^v")
+                [HotkeyForm]::PasteFromClipboard()
                 Log "(pasted)"
             } else {
                 Log "Empty transcription."
             }
         } else {
-            Log "WARNING: no result after 125s"
+            Log "WARNING: no result after $($attempts * 100)ms (daemon alive: $(-not $script:daemonProc.HasExited))"
         }
 
         # Always clean up after cycle (success or timeout) so next cycle starts fresh
