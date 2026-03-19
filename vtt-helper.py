@@ -25,6 +25,8 @@ LOG_FILE = os.path.join(VTT_DIR, "helper.log")
 RATE = 16000
 CHANNELS = 1
 PRE_BUFFER_SECS = 2
+MAX_RECORDING_SECS = 300  # 5 minute safety cap
+LOG_MAX_BYTES = 2 * 1024 * 1024  # 2 MB log rotation threshold
 
 # Audio feedback sounds (played async so they don't block recording)
 SND_START = r"C:\Windows\Media\Speech On.wav"
@@ -43,13 +45,20 @@ os.makedirs(VTT_DIR, exist_ok=True)
 def log(msg):
     ts = time.strftime("%H:%M:%S")
     line = f"{ts} {msg}"
+    # Rotate log if it exceeds threshold
     try:
-        print(line, file=sys.stderr, flush=True)
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        print(line.encode("utf-8", errors="replace").decode("ascii", errors="replace"),
-              file=sys.stderr, flush=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            old = LOG_FILE + ".old"
+            if os.path.exists(old):
+                os.remove(old)
+            os.rename(LOG_FILE, old)
+    except Exception:
+        pass
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def load_config():
@@ -130,6 +139,7 @@ def daemon():
     ring = collections.deque(maxlen=pre_buffer_frames)
     recording_chunks = []
     is_recording = False
+    recording_start_time = [0.0]  # track when recording started
     lock = threading.Lock()  # protects is_recording and recording_chunks
 
     # Transcription state (background thread writes result here)
@@ -137,10 +147,16 @@ def daemon():
     transcription_lock = threading.Lock()
 
     def callback(indata, frames, time_info, status):
+        nonlocal is_recording
         samples = indata[:, 0].copy()
         with lock:
             if is_recording:
-                recording_chunks.append(samples)
+                # Safety cap: auto-stop after MAX_RECORDING_SECS
+                if time.time() - recording_start_time[0] > MAX_RECORDING_SECS:
+                    is_recording = False
+                    log(f"Recording auto-stopped after {MAX_RECORDING_SECS}s safety cap")
+                else:
+                    recording_chunks.append(samples)
             else:
                 ring.extend(samples)
 
@@ -180,6 +196,7 @@ def daemon():
             recording_chunks.clear()
             recording_chunks.append(np.array(list(ring), dtype=np.int16))
             is_recording = True
+            recording_start_time[0] = time.time()
         if sound_enabled:
             play_sound(SND_START)
         log(f"Recording started (pre-buffer={len(ring)} samples)")
@@ -244,6 +261,7 @@ def daemon():
     def handle_client(conn):
         """Handle a single client connection."""
         try:
+            conn.settimeout(5.0)  # prevent hung clients from blocking the server
             data = conn.recv(1024).decode("utf-8").strip()
             if not data:
                 return

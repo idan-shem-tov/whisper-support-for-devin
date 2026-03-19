@@ -18,6 +18,12 @@ function Log($msg) {
     $ts = Get-Date -Format "HH:mm:ss"
     $line = "$ts $msg"
     Write-Host $line
+    # Rotate log if > 2MB
+    if ((Test-Path $LOG_FILE) -and (Get-Item $LOG_FILE).Length -gt 2MB) {
+        $old = "$LOG_FILE.old"
+        Remove-Item $old -Force -ErrorAction SilentlyContinue
+        Rename-Item $LOG_FILE $old -ErrorAction SilentlyContinue
+    }
     Add-Content -Path $LOG_FILE -Value $line
 }
 
@@ -122,6 +128,12 @@ public class HotkeyForm : Form {
 "@
 
 function StartDaemon {
+    # Dispose previous process handle if any
+    if ($script:daemonProc) {
+        try { $script:daemonProc.Dispose() } catch {}
+        $script:daemonProc = $null
+    }
+
     # Clean up stale port file
     Remove-Item $PORT_FILE -Force -ErrorAction SilentlyContinue
 
@@ -131,7 +143,7 @@ function StartDaemon {
     $psi.Arguments = "`"$HELPER`" daemon"
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
-    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardError = $false
     $script:daemonProc = [System.Diagnostics.Process]::Start($psi)
     Log "  daemon PID=$($script:daemonProc.Id)"
 
