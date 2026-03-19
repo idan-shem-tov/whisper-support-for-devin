@@ -6,11 +6,13 @@ Global hotkey-triggered voice-to-text using [faster-whisper](https://github.com/
 
 - **Python daemon** (`vtt-helper.py`) runs in the background with:
   - Whisper model pre-loaded in memory (no startup delay per transcription)
+  - TCP server on localhost for instant IPC with the hotkey script
   - Continuous audio listening with a 2-second ring buffer (no clipped beginnings)
   - Auto-normalization of quiet microphone input
-  - Auto language detection (English, Hebrew, etc.) or forced language via config
+  - Audio feedback (configurable) on recording start/stop
 - **PowerShell hotkey listener** (`vtt-hotkey.ps1`) handles:
   - Global Ctrl+Shift+Enter hotkey via Windows `WM_HOTKEY` messages (instant response)
+  - TCP client to send commands to the daemon (start/stop/ping)
   - Daemon lifecycle (auto-restart if it crashes)
   - Clipboard + paste of transcription result
 - **VBS launcher** (`vtt-hotkey-startup.vbs`) runs everything silently on Windows login

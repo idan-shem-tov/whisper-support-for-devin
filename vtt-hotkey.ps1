@@ -2,15 +2,13 @@
 # All Windows-native: no WSL dependency.
 # Uses WM_HOTKEY messages for instant hotkey response.
 # Python daemon handles recording + transcription with model pre-loaded.
+# IPC via TCP socket on localhost (daemon writes port to %TEMP%\vtt\port.txt).
 # Run: powershell -ExecutionPolicy Bypass -File C:\Users\Idan_Shemtov\vtt\vtt-hotkey.ps1
 
 $PYTHON = "C:\Program Files\Python312\python.exe"
 $HELPER = "C:\Users\Idan_Shemtov\vtt\vtt-helper.py"
 $VTT_DIR = Join-Path $env:TEMP "vtt"
-$START_FILE = Join-Path $VTT_DIR "start"
-$STOP_FILE = Join-Path $VTT_DIR "stop"
-$READY_FILE = Join-Path $VTT_DIR "ready"
-$RESULT_FILE = Join-Path $VTT_DIR "result.txt"
+$PORT_FILE = Join-Path $VTT_DIR "port.txt"
 $LOG_FILE = Join-Path $VTT_DIR "debug.log"
 $PID_FILE = Join-Path $VTT_DIR "hotkey.pid"
 
@@ -21,6 +19,27 @@ function Log($msg) {
     $line = "$ts $msg"
     Write-Host $line
     Add-Content -Path $LOG_FILE -Value $line
+}
+
+# --- TCP client: send a command to the daemon, return the response ---
+function Send-DaemonCommand($cmd, $timeoutMs = 130000) {
+    try {
+        if (!(Test-Path $PORT_FILE)) { return $null }
+        $port = [int](Get-Content $PORT_FILE).Trim()
+        $client = New-Object System.Net.Sockets.TcpClient
+        $client.Connect("127.0.0.1", $port)
+        $client.ReceiveTimeout = $timeoutMs
+        $stream = $client.GetStream()
+        $writer = New-Object System.IO.StreamWriter($stream)
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+        $writer.WriteLine($cmd)
+        $writer.Flush()
+        $response = $reader.ReadLine()
+        $client.Close()
+        return $response
+    } catch {
+        return $null
+    }
 }
 
 # --- Kill any previous VTT instance ---
@@ -50,6 +69,9 @@ function KillPreviousInstance {
             Log "Killing orphaned daemon (PID $($_.ProcessId))..."
             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         }
+
+    # Clean up stale port file
+    Remove-Item $PORT_FILE -Force -ErrorAction SilentlyContinue
 }
 
 KillPreviousInstance
@@ -98,10 +120,8 @@ public class HotkeyForm : Form {
 "@
 
 function StartDaemon {
-    # Clean signal files
-    foreach ($f in @($START_FILE, $STOP_FILE, $READY_FILE, $RESULT_FILE)) {
-        if (Test-Path $f) { Remove-Item $f -Force }
-    }
+    # Clean up stale port file
+    Remove-Item $PORT_FILE -Force -ErrorAction SilentlyContinue
 
     Log "Starting daemon (loading whisper model)..."
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -113,14 +133,15 @@ function StartDaemon {
     $script:daemonProc = [System.Diagnostics.Process]::Start($psi)
     Log "  daemon PID=$($script:daemonProc.Id)"
 
-    # Wait for ready (max 30s)
+    # Wait for port file (means daemon is ready and listening)
     $waited = 0
-    while (!(Test-Path $READY_FILE) -and $waited -lt 300) {
+    while (!(Test-Path $PORT_FILE) -and $waited -lt 300) {
         Start-Sleep -Milliseconds 100
         $waited++
     }
-    if (Test-Path $READY_FILE) {
-        Log "Daemon ready"
+    if (Test-Path $PORT_FILE) {
+        $port = (Get-Content $PORT_FILE).Trim()
+        Log "Daemon ready on port $port"
     } else {
         Log "WARNING: daemon did not become ready"
     }
@@ -180,72 +201,40 @@ $form.Add_HotkeyPressed({
     if (-not $script:recording) {
         # --- START RECORDING ---
         EnsureDaemon
-        # Clean up stale files from any previous failed cycle
-        foreach ($f in @($RESULT_FILE, $STOP_FILE, $START_FILE)) {
-            Remove-Item $f -Force -ErrorAction SilentlyContinue
-        }
         Log "Recording..."
-        New-Item -ItemType File -Path $START_FILE -Force | Out-Null
-        $script:recording = $true
+        $result = Send-DaemonCommand "start" 5000
+        if ($result -eq $null) {
+            Log "WARNING: daemon not responding, restarting..."
+            StartDaemon
+            $result = Send-DaemonCommand "start" 5000
+        }
+        if ($result -eq "ok" -or $result -eq "already_recording") {
+            $script:recording = $true
+        } else {
+            Log "WARNING: start failed: $result"
+        }
     } else {
         # --- STOP RECORDING + TRANSCRIBE ---
         Log "Stopping..."
         $script:recording = $false
         $script:busy = $true
 
-        # Check if daemon is alive before waiting for a result
-        if ($script:daemonProc -eq $null -or $script:daemonProc.HasExited) {
-            Log "WARNING: daemon died during recording, restarting..."
+        # Send stop command — blocks until transcription is done (up to 130s)
+        $text = Send-DaemonCommand "stop"
+
+        if ($text -eq $null) {
+            # Connection failed = daemon died
+            Log "WARNING: daemon died during transcription, restarting..."
             StartDaemon
-            foreach ($f in @($START_FILE, $STOP_FILE, $RESULT_FILE)) {
-                Remove-Item $f -Force -ErrorAction SilentlyContinue
-            }
-            $script:busy = $false
-            return
-        }
-
-        # Signal stop
-        New-Item -ItemType File -Path $STOP_FILE -Force | Out-Null
-
-        # Wait for result.txt (daemon writes it after transcription)
-        # Also check daemon health periodically to bail early if it dies
-        $attempts = 0
-        while (!(Test-Path $RESULT_FILE) -and $attempts -lt 1250) {
-            Start-Sleep -Milliseconds 100
-            $attempts++
-            # Every 2 seconds, check if daemon is still alive
-            if ($attempts % 20 -eq 0 -and $script:daemonProc.HasExited) {
-                Log "WARNING: daemon died while transcribing, restarting..."
-                StartDaemon
-                break
-            }
-        }
-
-        if (Test-Path $RESULT_FILE) {
-            $raw = Get-Content -Path $RESULT_FILE -Encoding UTF8 -Raw
-            if ($raw) {
-                $text = $raw.Trim()
-            } else {
-                $text = ""
-            }
-            Log "  result: [$text]  (waited $($attempts * 100)ms)"
-
-            if ($text -and $text.Length -gt 0) {
-                [System.Windows.Forms.Clipboard]::SetText($text)
-                Log ">>> $text"
-                Start-Sleep -Milliseconds 200
-                [HotkeyForm]::PasteFromClipboard()
-                Log "(pasted)"
-            } else {
-                Log "Empty transcription."
-            }
+        } elseif ($text.Length -gt 0) {
+            Log "  result: [$text]"
+            [System.Windows.Forms.Clipboard]::SetText($text)
+            Log ">>> $text"
+            Start-Sleep -Milliseconds 200
+            [HotkeyForm]::PasteFromClipboard()
+            Log "(pasted)"
         } else {
-            Log "WARNING: no result after $($attempts * 100)ms (daemon alive: $(-not $script:daemonProc.HasExited))"
-        }
-
-        # Always clean up after cycle (success or timeout) so next cycle starts fresh
-        foreach ($f in @($START_FILE, $STOP_FILE, $RESULT_FILE)) {
-            Remove-Item $f -Force -ErrorAction SilentlyContinue
+            Log "Empty transcription."
         }
 
         $script:busy = $false

@@ -7,6 +7,7 @@ Usage:
 import sys
 import os
 import time
+import socket
 import collections
 import configparser
 import threading
@@ -19,10 +20,7 @@ VTT_DIR = os.path.join(os.environ.get("TEMP", r"C:\Temp"), "vtt")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.ini")
 WAV_PATH = os.path.join(VTT_DIR, "recording.wav")
-START_FILE = os.path.join(VTT_DIR, "start")
-STOP_FILE = os.path.join(VTT_DIR, "stop")
-READY_FILE = os.path.join(VTT_DIR, "ready")
-RESULT_FILE = os.path.join(VTT_DIR, "result.txt")
+PORT_FILE = os.path.join(VTT_DIR, "port.txt")
 LOG_FILE = os.path.join(VTT_DIR, "helper.log")
 RATE = 16000
 CHANNELS = 1
@@ -109,17 +107,9 @@ def pick_device():
 
 def daemon():
     """Run as daemon: record with pre-buffer, transcribe with pre-loaded model.
-    Flow:
-      1. Loads whisper model at startup (one-time cost)
-      2. Listens with a 2s ring buffer
-      3. START_FILE -> begin capturing (includes pre-buffer)
-      4. STOP_FILE -> stop, normalize, transcribe, write RESULT_FILE
+    Uses a TCP server on localhost for IPC with the hotkey script.
+    Commands: start, stop, ping
     """
-    # Cleanup
-    for f in [START_FILE, STOP_FILE, READY_FILE, WAV_PATH, RESULT_FILE]:
-        if os.path.exists(f):
-            os.remove(f)
-
     # Load config
     config = load_config()
     sound_enabled = config["sound"]
@@ -137,169 +127,152 @@ def daemon():
     ring = collections.deque(maxlen=pre_buffer_frames)
     recording_chunks = []
     is_recording = False
+    lock = threading.Lock()  # protects is_recording and recording_chunks
 
     def callback(indata, frames, time_info, status):
-        nonlocal is_recording
         samples = indata[:, 0].copy()
-        if is_recording:
-            recording_chunks.append(samples)
-        else:
-            ring.extend(samples)
+        with lock:
+            if is_recording:
+                recording_chunks.append(samples)
+            else:
+                ring.extend(samples)
 
     log(f"Daemon starting, device={device}, pre-buffer={PRE_BUFFER_SECS}s")
 
-    # Transcription state (non-blocking)
-    transcribe_thread = None
-    transcribe_start_time = None
-    transcribe_result = [None, None]  # [text, info]
-    transcribe_error = [None]
-    transcribe_duration = 0.0
+    def do_transcribe(wav_path):
+        """Transcribe a WAV file synchronously. Returns (text, language)."""
+        try:
+            kwargs = {"beam_size": 5}
+            if language:
+                kwargs["language"] = language
+            segments, info = model.transcribe(wav_path, **kwargs)
+            text = " ".join(s.text.strip() for s in segments)
+            lang = info.language if info else "?"
+            return text, lang
+        except Exception as e:
+            log(f"ERROR: Transcription failed: {e}")
+            return "", "?"
 
-    def start_transcribe_thread(wav_path, audio_duration):
-        nonlocal transcribe_thread, transcribe_start_time, transcribe_duration
-        transcribe_result[0] = None
-        transcribe_result[1] = None
-        transcribe_error[0] = None
-        transcribe_duration = audio_duration
+    def handle_start():
+        """Handle 'start' command: begin recording."""
+        nonlocal is_recording
+        with lock:
+            if is_recording:
+                return "already_recording"
+            recording_chunks.clear()
+            recording_chunks.append(np.array(list(ring), dtype=np.int16))
+            is_recording = True
+        if sound_enabled:
+            play_sound(SND_START)
+        log(f"Recording started (pre-buffer={len(ring)} samples)")
+        return "ok"
 
-        def do_transcribe():
-            try:
-                kwargs = {"beam_size": 5}
-                if language:
-                    kwargs["language"] = language
-                segments, info = model.transcribe(wav_path, **kwargs)
-                text = " ".join(s.text.strip() for s in segments)
-                transcribe_result[0] = text
-                transcribe_result[1] = info
-            except Exception as e:
-                transcribe_error[0] = e
+    def handle_stop():
+        """Handle 'stop' command: stop recording, transcribe, return result."""
+        nonlocal is_recording
+        with lock:
+            if not is_recording:
+                return ""
+            is_recording = False
+            chunks = list(recording_chunks)
+            recording_chunks.clear()
 
-        transcribe_thread = threading.Thread(target=do_transcribe, daemon=True)
-        transcribe_start_time = time.time()
-        transcribe_thread.start()
+        if sound_enabled:
+            play_sound(SND_STOP)
 
-    def check_transcribe_done():
-        """Check if background transcription finished. Returns True if done/timed out."""
-        nonlocal transcribe_thread, transcribe_start_time
-        if transcribe_thread is None:
-            return True
-        if not transcribe_thread.is_alive():
-            elapsed = time.time() - transcribe_start_time
-            if transcribe_error[0]:
-                log(f"ERROR: Transcription failed: {transcribe_error[0]}")
-                with open(RESULT_FILE, "w", encoding="utf-8") as f:
-                    f.write("")
+        if not chunks:
+            log("No audio captured")
+            return ""
+
+        audio = np.concatenate(chunks)
+        peak = int(np.max(np.abs(audio)))
+        rms = float(np.sqrt(np.mean(audio.astype(float)**2)))
+        duration = len(audio) / RATE
+        log(f"Recording stopped: {duration:.1f}s, peak={peak}, rms={rms:.0f}")
+
+        # Normalize audio
+        if peak > 10:
+            target = 26000
+            gain = min(target / peak, 200)
+            audio_float = audio.astype(np.float64) * gain
+            audio = np.clip(audio_float, -32767, 32767).astype(np.int16)
+            log(f"Applied {gain:.1f}x gain")
+
+        # Save wav (needed by faster_whisper)
+        wav.write(WAV_PATH, RATE, audio)
+
+        # Transcribe synchronously (blocks until done)
+        log("Transcribing...")
+        text, lang = do_transcribe(WAV_PATH)
+        elapsed = duration  # approximate
+        log(f"Transcribed ({lang}): [{text}]")
+
+        # Clean up wav
+        try:
+            os.remove(WAV_PATH)
+        except Exception:
+            pass
+
+        return text
+
+    def handle_client(conn):
+        """Handle a single client connection."""
+        try:
+            data = conn.recv(1024).decode("utf-8").strip()
+            if not data:
+                return
+
+            if data == "ping":
+                conn.sendall(b"pong\n")
+            elif data == "start":
+                result = handle_start()
+                conn.sendall(f"{result}\n".encode("utf-8"))
+            elif data == "stop":
+                result = handle_stop()
+                conn.sendall(f"{result}\n".encode("utf-8"))
             else:
-                text = transcribe_result[0] or ""
-                info = transcribe_result[1]
-                lang = info.language if info else "?"
-                log(f"Transcribed in {elapsed:.1f}s, lang={lang}: [{text}]")
-                with open(RESULT_FILE, "w", encoding="utf-8") as f:
-                    f.write(text)
-            cleanup_after_transcribe()
-            return True
-        # Check timeout
-        if time.time() - transcribe_start_time > TRANSCRIBE_TIMEOUT_SECS:
-            log(f"ERROR: Transcription timed out after {TRANSCRIBE_TIMEOUT_SECS}s ({transcribe_duration:.1f}s audio). Writing empty result.")
-            with open(RESULT_FILE, "w", encoding="utf-8") as f:
-                f.write("")
-            cleanup_after_transcribe()
-            return True
-        return False
+                conn.sendall(b"error: unknown command\n")
+        except Exception as e:
+            log(f"Client handler error: {e}")
+        finally:
+            conn.close()
 
-    def cleanup_after_transcribe():
-        nonlocal transcribe_thread, transcribe_start_time
-        transcribe_thread = None
-        transcribe_start_time = None
-        for cleanup_file in [WAV_PATH, START_FILE, STOP_FILE]:
-            if os.path.exists(cleanup_file):
-                try:
-                    os.remove(cleanup_file)
-                except Exception:
-                    pass
-
+    # Start audio stream
     with sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype="int16",
                         callback=callback, device=device):
-        # Signal that we're ready
-        open(READY_FILE, "w").close()
-        log("Daemon ready, waiting for signals...")
+
+        # Start TCP server on a free port
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(1)
+        srv.settimeout(1.0)  # accept timeout for clean shutdown
+
+        # Write port file (signals "ready" to the hotkey script)
+        with open(PORT_FILE, "w") as f:
+            f.write(str(port))
+        log(f"Daemon ready, listening on 127.0.0.1:{port}")
 
         try:
             while True:
-                # Check if a background transcription finished
-                is_transcribing = not check_transcribe_done()
-
-                if is_transcribing:
-                    # Drain any signal files created while we're busy
-                    for f in [START_FILE, STOP_FILE]:
-                        if os.path.exists(f):
-                            try:
-                                os.remove(f)
-                            except Exception:
-                                pass
-
-                elif not is_recording and os.path.exists(START_FILE):
-                    os.remove(START_FILE)
-                    # Clean up stale files from any previous failed cycle
-                    for stale in [RESULT_FILE, STOP_FILE]:
-                        if os.path.exists(stale):
-                            try:
-                                os.remove(stale)
-                            except Exception:
-                                pass
-                    recording_chunks.clear()
-                    recording_chunks.append(np.array(list(ring), dtype=np.int16))
-                    is_recording = True
-                    if sound_enabled:
-                        play_sound(SND_START)
-                    log(f"Recording started (pre-buffer={len(ring)} samples)")
-
-                elif is_recording and os.path.exists(STOP_FILE):
-                    os.remove(STOP_FILE)
-                    is_recording = False
-                    if sound_enabled:
-                        play_sound(SND_STOP)
-
-                    if recording_chunks:
-                        audio = np.concatenate(recording_chunks)
-                        peak = int(np.max(np.abs(audio)))
-                        rms = float(np.sqrt(np.mean(audio.astype(float)**2)))
-                        duration = len(audio) / RATE
-                        log(f"Recording stopped: {duration:.1f}s, peak={peak}, rms={rms:.0f}")
-                        recording_chunks.clear()
-
-                        # Normalize audio
-                        if peak > 10:
-                            target = 26000
-                            gain = min(target / peak, 200)
-                            audio_float = audio.astype(np.float64) * gain
-                            audio = np.clip(audio_float, -32767, 32767).astype(np.int16)
-                            log(f"Applied {gain:.1f}x gain")
-
-                        # Save wav (needed by faster_whisper)
-                        wav.write(WAV_PATH, RATE, audio)
-
-                        # Start non-blocking transcription
-                        log("Transcribing...")
-                        start_transcribe_thread(WAV_PATH, duration)
-                    else:
-                        log("No audio captured")
-                        with open(RESULT_FILE, "w") as f:
-                            f.write("")
-
-                time.sleep(0.05)
+                try:
+                    conn, addr = srv.accept()
+                    handle_client(conn)
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    log(f"Accept error: {e}")
+                    time.sleep(0.1)
         except Exception as e:
-            log(f"FATAL: Main loop error: {e}")
-            # Clean up so PS side doesn't hang waiting
-            is_recording = False
-            recording_chunks.clear()
-            for f in [READY_FILE, START_FILE, STOP_FILE]:
-                if os.path.exists(f):
-                    try:
-                        os.remove(f)
-                    except Exception:
-                        pass
+            log(f"FATAL: Server error: {e}")
             raise
+        finally:
+            srv.close()
+            try:
+                os.remove(PORT_FILE)
+            except Exception:
+                pass
 
 
 def test_mic():

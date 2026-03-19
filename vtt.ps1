@@ -10,6 +10,7 @@ param([string]$Command = "status")
 
 $VTT_DIR = Join-Path $env:TEMP "vtt"
 $PID_FILE = Join-Path $VTT_DIR "hotkey.pid"
+$PORT_FILE = Join-Path $VTT_DIR "port.txt"
 $LOG_FILE = Join-Path $VTT_DIR "debug.log"
 $HELPER_LOG = Join-Path $VTT_DIR "helper.log"
 $HOTKEY_SCRIPT = Join-Path $PSScriptRoot "vtt-hotkey.ps1"
@@ -55,6 +56,28 @@ function Stop-Vtt {
         Write-Host "VTT is not running" -ForegroundColor Gray
     }
     if (Test-Path $PID_FILE) { Remove-Item $PID_FILE -Force }
+    Remove-Item $PORT_FILE -Force -ErrorAction SilentlyContinue
+}
+
+function Ping-Daemon {
+    # Try to send a TCP ping to the daemon. Returns $true if it responds.
+    try {
+        if (!(Test-Path $PORT_FILE)) { return $false }
+        $port = [int](Get-Content $PORT_FILE).Trim()
+        $client = New-Object System.Net.Sockets.TcpClient
+        $client.Connect("127.0.0.1", $port)
+        $client.ReceiveTimeout = 3000
+        $stream = $client.GetStream()
+        $writer = New-Object System.IO.StreamWriter($stream)
+        $reader = New-Object System.IO.StreamReader($stream)
+        $writer.WriteLine("ping")
+        $writer.Flush()
+        $response = $reader.ReadLine()
+        $client.Close()
+        return ($response -eq "pong")
+    } catch {
+        return $false
+    }
 }
 
 function Start-Vtt {
@@ -98,13 +121,12 @@ switch ($Command.ToLower()) {
             $vpid = Get-VttPid
             Write-Host "VTT is running (PID $vpid)" -ForegroundColor Green
             Write-Host "Hotkey: Ctrl+Shift+Enter"
-            # Check daemon
-            $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$vpid" -ErrorAction SilentlyContinue
-            $daemon = $children | Where-Object { $_.CommandLine -like "*daemon*" }
-            if ($daemon) {
-                Write-Host "Daemon: running (PID $($daemon.ProcessId))" -ForegroundColor Green
+            # Check daemon via TCP ping
+            if (Ping-Daemon) {
+                $port = (Get-Content $PORT_FILE).Trim()
+                Write-Host "Daemon: running (port $port)" -ForegroundColor Green
             } else {
-                Write-Host "Daemon: NOT running (will restart on next hotkey)" -ForegroundColor Yellow
+                Write-Host "Daemon: NOT responding (will restart on next hotkey)" -ForegroundColor Yellow
             }
         } else {
             Write-Host "VTT is not running" -ForegroundColor Red

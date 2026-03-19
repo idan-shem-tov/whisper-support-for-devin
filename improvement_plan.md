@@ -39,13 +39,13 @@ Tracked improvements for the VTT (Voice-to-Text) project.
 
 ---
 
-## Pending
-
 ### #1 — Replace file-based IPC with localhost sockets
-- **Status:** Not started
-- **Problem:** Polling `%TEMP%\vtt\` every 50ms is slow, fragile, and can race.
-- **Solution:** Use a localhost TCP socket. The daemon listens on a port, the hotkey script connects and sends commands. Communication becomes instant and atomic.
+- **Status:** Done
+- **Problem:** Polling `%TEMP%\vtt\` every 50ms was slow, fragile, and could race on file read/write.
+- **Solution:** Daemon runs a TCP server on localhost (auto-assigned port, written to `port.txt`). Hotkey script connects per command: `start` (begin recording), `stop` (stop + transcribe, blocks until result), `ping` (health check). No more polling — communication is instant and atomic. If daemon dies mid-transcription, the TCP connection breaks immediately.
 - **Files changed:** `vtt-helper.py`, `vtt-hotkey.ps1`, `vtt.ps1`
+- **Files removed from IPC:** `start`, `stop`, `ready`, `result.txt` signal files
+- **Files added:** `port.txt` (daemon's TCP port, also serves as ready indicator)
 
 ---
 
