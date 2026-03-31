@@ -14,6 +14,10 @@ $PID_FILE = Join-Path $VTT_DIR "hotkey.pid"
 
 if (!(Test-Path $VTT_DIR)) { New-Item -ItemType Directory -Path $VTT_DIR -Force | Out-Null }
 
+# Early boot log — written before anything else so we can diagnose startup failures
+$bootLine = "$(Get-Date -Format 'HH:mm:ss') [BOOT] vtt-hotkey.ps1 starting (PID=$PID)"
+Add-Content -Path $LOG_FILE -Value $bootLine -ErrorAction SilentlyContinue
+
 function Log($msg) {
     $ts = Get-Date -Format "HH:mm:ss"
     $line = "$ts $msg"
@@ -86,6 +90,8 @@ KillPreviousInstance
 
 # Write our PID so future instances can kill us
 Set-Content -Path $PID_FILE -Value $PID
+
+try {
 
 Add-Type -AssemblyName System.Windows.Forms
 
@@ -302,3 +308,11 @@ Log "Ctrl+Shift+Enter: toggle recording"
 Log "Listening..."
 
 [System.Windows.Forms.Application]::Run($form)
+
+} catch {
+    # Log fatal errors so we can diagnose startup failures
+    $errLine = "$(Get-Date -Format 'HH:mm:ss') [FATAL] $($_.Exception.Message)"
+    Add-Content -Path $LOG_FILE -Value $errLine -ErrorAction SilentlyContinue
+    Add-Content -Path $LOG_FILE -Value "$(Get-Date -Format 'HH:mm:ss') [FATAL] $($_.ScriptStackTrace)" -ErrorAction SilentlyContinue
+    throw
+}

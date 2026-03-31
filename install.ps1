@@ -73,15 +73,15 @@ sound = on
 
 # --- 5. Set up auto-start on login ---
 Write-Host "[5/6] Setting up auto-start on login..." -ForegroundColor Yellow
-$startupDir = [Environment]::GetFolderPath("Startup")
-$vbsPath = Join-Path $startupDir "vtt-hotkey-startup.vbs"
-$vbsContent = @"
-' Silent launcher for vtt-hotkey.ps1
-Set objShell = CreateObject("WScript.Shell")
-objShell.Run "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File $hotkeyPath", 0, False
-"@
-Set-Content -Path $vbsPath -Value $vbsContent
-Write-Host "  Auto-start enabled" -ForegroundColor Green
+
+# Use Registry Run key — same mechanism as Teams, OneDrive, Edge.
+# The Startup folder is ignored on many corporate machines (Group Policy),
+# and VBScript (.vbs) is deprecated in Windows 11 24H2+.
+$runKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+$launcherPath = Join-Path $scriptDir "vtt-startup.ps1"
+$runValue = "conhost.exe --headless -- powershell.exe -ExecutionPolicy Bypass -NoProfile -File `"$launcherPath`""
+Set-ItemProperty -Path $runKey -Name "VTT-VoiceToText" -Value $runValue
+Write-Host "  Auto-start enabled (Registry Run key)" -ForegroundColor Green
 
 # --- 6. Pre-download model + start VTT ---
 Write-Host "[6/6] Downloading Whisper model and starting VTT..." -ForegroundColor Yellow

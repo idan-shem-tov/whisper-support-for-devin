@@ -89,16 +89,36 @@ function Start-Vtt {
     Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$HOTKEY_SCRIPT`"" -WindowStyle Hidden
 
     # Wait for port file (means daemon is loaded and hotkey is registered)
+    # Model loading can take 30-40s + a few seconds for .NET/C# JIT overhead
+    $maxWait = 180  # 90 seconds (180 * 500ms)
     $waited = 0
-    while (!(Test-Path $PORT_FILE) -and $waited -lt 60) {
+    while (!(Test-Path $PORT_FILE) -and $waited -lt $maxWait) {
         Start-Sleep -Milliseconds 500
         $waited++
+        # Show progress every 5 seconds
+        if ($waited % 10 -eq 0) {
+            $elapsed = [math]::Round($waited * 0.5)
+            Write-Host "  Loading whisper model... (${elapsed}s)" -ForegroundColor Gray
+        }
     }
 
     if ((Test-Path $PORT_FILE) -and (Is-Running)) {
-        Write-Host "VTT started (PID $(Get-VttPid))" -ForegroundColor Green
+        $elapsed = [math]::Round($waited * 0.5)
+        Write-Host "VTT started (PID $(Get-VttPid)) in ${elapsed}s" -ForegroundColor Green
         Write-Host "Hotkey: Ctrl+Shift+Enter" -ForegroundColor Cyan
     } else {
+        # Check if process is still alive but just slow
+        if (Test-Path $PID_FILE) {
+            $vpid = (Get-Content $PID_FILE -ErrorAction SilentlyContinue)
+            if ($vpid) {
+                $proc = Get-Process -Id $vpid.Trim() -ErrorAction SilentlyContinue
+                if ($proc) {
+                    Write-Host "VTT process is still loading (PID $($vpid.Trim())). It may start shortly." -ForegroundColor Yellow
+                    Write-Host "Check status with: vtt status" -ForegroundColor Gray
+                    return
+                }
+            }
+        }
         Write-Host "Failed to start. Check logs: vtt logs" -ForegroundColor Red
     }
 }
