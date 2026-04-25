@@ -35,9 +35,10 @@ SND_STOP  = r"C:\Windows\Media\Speech Off.wav"
 def play_sound(path):
     """Play a WAV file asynchronously (non-blocking)."""
     try:
-        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-    except Exception:
-        pass
+        # SND_NODEFAULT: don't play any fallback system sound if the file is missing
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except Exception as e:
+        log(f"WARNING: failed to play sound '{path}': {e}")
 
 os.makedirs(VTT_DIR, exist_ok=True)
 
@@ -192,6 +193,10 @@ def daemon():
         nonlocal is_recording
         with lock:
             if is_recording:
+                # Still provide feedback to the user if the hotkey state got out of sync
+                if sound_enabled:
+                    play_sound(SND_START)
+                log("Start requested but already recording")
                 return "already_recording"
             recording_chunks.clear()
             recording_chunks.append(np.array(list(ring), dtype=np.int16))

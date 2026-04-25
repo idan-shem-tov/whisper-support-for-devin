@@ -5,6 +5,7 @@
 #   vtt restart  - Restart VTT
 #   vtt status   - Show if VTT is running
 #   vtt logs     - Show recent logs
+#   vtt tray     - Start the system tray UI
 
 param([string]$Command = "status")
 
@@ -14,6 +15,7 @@ $PORT_FILE = Join-Path $VTT_DIR "port.txt"
 $LOG_FILE = Join-Path $VTT_DIR "debug.log"
 $HELPER_LOG = Join-Path $VTT_DIR "helper.log"
 $HOTKEY_SCRIPT = Join-Path $PSScriptRoot "vtt-hotkey.ps1"
+$TRAY_SCRIPT = Join-Path $PSScriptRoot "vtt-tray.ps1"
 
 function Is-Running {
     if (Test-Path $PID_FILE) {
@@ -167,7 +169,14 @@ switch ($Command.ToLower()) {
             Write-Host "(no logs)"
         }
     }
+    "tray" {
+        Write-Host "Starting VTT tray..." -ForegroundColor Cyan
+        Start-Process powershell `
+            -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$TRAY_SCRIPT`"" `
+            -WindowStyle Hidden
+        Write-Host "Tray icon started (check the notification area)" -ForegroundColor Green
+    }
     default {
-        Write-Host "Usage: vtt [start|stop|restart|status|logs]" -ForegroundColor Yellow
+        Write-Host "Usage: vtt [start|stop|restart|status|logs|tray]" -ForegroundColor Yellow
     }
 }

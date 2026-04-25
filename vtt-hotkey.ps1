@@ -155,7 +155,7 @@ function StartDaemon {
 
     # Wait for port file (means daemon is ready and listening)
     $waited = 0
-    while (!(Test-Path $PORT_FILE) -and $waited -lt 300) {
+    while (!(Test-Path $PORT_FILE) -and $waited -lt 900) {
         Start-Sleep -Milliseconds 100
         $waited++
     }

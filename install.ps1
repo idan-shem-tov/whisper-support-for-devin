@@ -93,11 +93,17 @@ if ($LASTEXITCODE -ne 0) {
 # Start VTT now
 & powershell -ExecutionPolicy Bypass -File $vttPath start
 
+# Start the tray UI now
+$trayPath = Join-Path $scriptDir "vtt-tray.ps1"
+Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$trayPath`"" -WindowStyle Hidden
+Write-Host "  Tray icon started (check your notification area)" -ForegroundColor Green
+
 Write-Host ""
 Write-Host "  Installation complete!" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  Hotkey:    Ctrl+Shift+Enter (toggle recording)" -ForegroundColor White
+Write-Host "  Tray:      Look for the VTT icon in the notification area (bottom-right)" -ForegroundColor White
 Write-Host "  Config:    $configPath" -ForegroundColor Gray
-Write-Host "  Manage:    powershell -ExecutionPolicy Bypass -File $vttPath [start|stop|restart|status|logs]" -ForegroundColor Gray
+Write-Host "  Manage:    powershell -ExecutionPolicy Bypass -File $vttPath [start|stop|restart|status|logs|tray]" -ForegroundColor Gray
 Write-Host "  Auto-start is enabled (runs on Windows login)" -ForegroundColor Gray
 Write-Host ""

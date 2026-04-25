@@ -19,7 +19,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 That's it. After install completes, press **Ctrl+Shift+Enter** to try it.
 
-VTT will auto-start on every Windows login.
+VTT will auto-start on every Windows login, including the system tray icon.
 
 ## Usage
 
@@ -29,6 +29,33 @@ VTT will auto-start on every Windows login.
 | Stop + transcribe + paste | Ctrl+Shift+Enter |
 
 You'll hear a sound when recording starts and stops. The transcribed text is automatically pasted at your cursor.
+
+## System Tray
+
+VTT includes a lightweight system tray UI that starts automatically on login alongside the hotkey listener.
+
+**To start the tray manually:**
+```powershell
+powershell -ExecutionPolicy Bypass -File vtt.ps1 tray
+```
+
+The tray icon sits in your notification area (bottom-right). Its color reflects the current state:
+
+| Icon color | Meaning |
+|------------|---------|
+| Green | VTT is running and ready |
+| Amber | Starting — whisper model loading |
+| Gray | Stopped |
+
+**Right-click the icon** for quick actions: Start, Stop, Restart, Open Dashboard.
+
+**Double-click the icon** (or choose "Open Dashboard") to open the VTT dashboard:
+
+- **Status panel** — live running/stopped indicator with PID
+- **Action buttons** — Start, Stop, Restart, open Config in Notepad
+- **Log viewer** — combined tail of both log files, auto-refreshes every 3 seconds (only re-reads when files change), adjustable line count
+
+The tray is single-instance: launching a second copy exits silently so you never get duplicate icons.
 
 ## Configuration
 
@@ -71,13 +98,15 @@ powershell -ExecutionPolicy Bypass -File vtt.ps1 <command>
 | `stop` | Stop VTT |
 | `restart` | Restart VTT (use after config changes) |
 | `status` | Check if VTT is running |
-| `logs` | Show recent logs |
+| `logs` | Show recent logs in the terminal |
+| `tray` | Start the system tray UI |
 
 ## How It Works
 
 - **Python daemon** (`vtt-helper.py`): Whisper model pre-loaded in memory, TCP server on localhost for instant IPC, 2-second audio pre-buffer (no clipped beginnings), auto-gain normalization, audio feedback sounds.
 - **PowerShell hotkey listener** (`vtt-hotkey.ps1`): Global hotkey via `WM_HOTKEY`, TCP client for daemon commands, auto-restart on daemon crash, clipboard paste via `keybd_event`.
-- **Auto-start**: VBS launcher in Windows Startup folder runs everything silently on login.
+- **System tray UI** (`vtt-tray.ps1`): WinForms `NotifyIcon` with a single 3-second master timer. Status is cached to avoid redundant `Get-Process` calls; logs are only re-read when file modification times change. Single-instance enforced via a named Windows Mutex.
+- **Auto-start**: Registry `Run` key launches both the hotkey listener and the tray UI silently on login.
 
 ## Troubleshooting
 
@@ -85,9 +114,13 @@ powershell -ExecutionPolicy Bypass -File vtt.ps1 <command>
 - **Wrong language / garbled output**: Set `language = en` (or your language) in `config.ini` and restart.
 - **No sound feedback**: Ensure your audio output device is working. Sound plays through the Python daemon.
 - **VTT seems stuck**: Run `vtt.ps1 restart`.
+- **Tray icon missing**: Run `vtt.ps1 tray`. It starts automatically on next login.
+- **Duplicate tray icons from a previous session**: Right-click each stale icon and choose "Exit Tray". Only one instance can run at a time going forward.
 
 ## Logs
 
 Logs are in `%TEMP%\vtt\`:
 - `debug.log` — hotkey events, paste actions
 - `helper.log` — recording, transcription, errors
+
+Both are viewable live in the dashboard (double-click the tray icon).
