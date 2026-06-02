@@ -11,6 +11,7 @@ $PID_FILE    = Join-Path $VTT_DIR "hotkey.pid"
 $PORT_FILE   = Join-Path $VTT_DIR "port.txt"
 $LOG_FILE    = Join-Path $VTT_DIR "debug.log"
 $HELPER_LOG  = Join-Path $VTT_DIR "helper.log"
+$TRAY_LOG    = Join-Path $VTT_DIR "tray.log"
 $VTT_SCRIPT  = Join-Path $PSScriptRoot "vtt.ps1"
 $CONFIG_FILE = Join-Path $PSScriptRoot "config.ini"
 
@@ -43,11 +44,20 @@ public static class WinApi {
 }
 "@
 
+# ── Logging helper ───────────────────────────────────────────────────────────
+function Write-TrayLog([string]$msg) {
+    $timestamp = Get-Date -Format "HH:mm:ss"
+    "$timestamp $msg" | Out-File -FilePath $TRAY_LOG -Append -Encoding UTF8
+}
+
 # ── Single-instance guard ─────────────────────────────────────────────────────
 if (-not [WinApi]::AcquireSingleInstance("Local\VTT-Tray-v1")) {
     # Another tray is already running – exit silently
+    Write-TrayLog "Another tray instance already running, exiting"
     exit 0
 }
+
+Write-TrayLog "[BOOT] vtt-tray.ps1 starting (PID=$PID)"
 
 # ── Status detection ──────────────────────────────────────────────────────────
 
@@ -216,12 +226,22 @@ function Update-WindowStatus {
 # ── Dashboard window ──────────────────────────────────────────────────────────
 
 function Show-Dashboard {
-    if ($script:mainForm -and -not $script:mainForm.IsDisposed) {
-        $script:mainForm.BringToFront(); return
-    }
+    try {
+        Write-TrayLog "Show-Dashboard called"
+        
+        if ($script:mainForm -and -not $script:mainForm.IsDisposed) {
+            Write-TrayLog "Form exists, bringing to front"
+            $script:mainForm.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+            $script:mainForm.Activate()
+            $script:mainForm.BringToFront()
+            $script:mainForm.TopMost = $true
+            $script:mainForm.TopMost = $false
+            return
+        }
 
-    # ── Form ──
-    $form = New-Object System.Windows.Forms.Form
+        Write-TrayLog "Creating new dashboard form"
+        # ── Form ──
+        $form = New-Object System.Windows.Forms.Form
     $form.Text          = "VTT Voice-to-Text"
     $form.Size          = New-Object System.Drawing.Size(820, 680)
     $form.StartPosition = "CenterScreen"
@@ -385,8 +405,13 @@ function Show-Dashboard {
 
     # Force an initial full load and status draw
     $script:forceRefresh = $true
-    $form.Add_Shown({ Update-WindowStatus; Refresh-Logs })
+    $form.Add_Shown({ 
+        Write-TrayLog "Dashboard form shown"
+        Update-WindowStatus
+        Refresh-Logs 
+    })
     $form.Add_FormClosed({
+        Write-TrayLog "Dashboard form closed"
         # Null out script refs so timer callbacks are no-ops after close
         $script:mainForm   = $null
         $script:logTxt     = $null
@@ -400,7 +425,18 @@ function Show-Dashboard {
         $script:accentPanel = $null
     })
 
-    $form.Show()
+        Write-TrayLog "Showing dashboard form"
+        $form.Show()
+        Write-TrayLog "Dashboard form.Show() completed"
+    } catch {
+        Write-TrayLog "ERROR in Show-Dashboard: $($_.Exception.Message)"
+        Write-TrayLog "Stack trace: $($_.ScriptStackTrace)"
+        [System.Windows.Forms.MessageBox]::Show(
+            "Failed to open dashboard:`n$($_.Exception.Message)", 
+            "VTT Error",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
 }
 
 # ── Tray icon + context menu ──────────────────────────────────────────────────
@@ -454,7 +490,17 @@ $miExit.Add_Click({
 $menu.Items.Add($miExit) | Out-Null
 
 $tray.ContextMenuStrip = $menu
-$tray.Add_DoubleClick({ Show-Dashboard })
+$tray.Add_DoubleClick({ 
+    try {
+        Write-TrayLog "Tray icon double-clicked"
+        Show-Dashboard 
+    } catch {
+        Write-TrayLog "ERROR in DoubleClick handler: $($_.Exception.Message)"
+    }
+})
+$tray.Add_Click({
+    Write-TrayLog "Tray icon single-clicked"
+})
 
 # ── Single master timer (3 s) ─────────────────────────────────────────────────
 # Replaces the two separate timers from before.
@@ -514,5 +560,9 @@ $tray.ShowBalloonTip(
     "Tray active. Double-click for dashboard. Ctrl+Shift+Enter to record.",
     [System.Windows.Forms.ToolTipIcon]::Info)
 
+Write-TrayLog "Tray initialized, entering message loop"
+
 # ── Message loop ──────────────────────────────────────────────────────────────
 [System.Windows.Forms.Application]::Run()
+
+Write-TrayLog "Message loop exited"

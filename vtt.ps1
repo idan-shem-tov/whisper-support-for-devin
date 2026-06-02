@@ -1,11 +1,12 @@
 # vtt.ps1 - Voice-to-Text management
 # Usage:
-#   vtt start    - Start VTT (kills any existing instance first)
-#   vtt stop     - Stop VTT
-#   vtt restart  - Restart VTT
-#   vtt status   - Show if VTT is running
-#   vtt logs     - Show recent logs
-#   vtt tray     - Start the system tray UI
+#   vtt start      - Start VTT (kills any existing instance first)
+#   vtt stop       - Stop VTT
+#   vtt restart    - Restart VTT
+#   vtt status     - Show if VTT is running
+#   vtt logs       - Show recent logs (hotkey, daemon, and tray)
+#   vtt tray       - Start the system tray UI
+#   vtt tray-stop  - Stop the system tray UI
 
 param([string]$Command = "status")
 
@@ -14,6 +15,7 @@ $PID_FILE = Join-Path $VTT_DIR "hotkey.pid"
 $PORT_FILE = Join-Path $VTT_DIR "port.txt"
 $LOG_FILE = Join-Path $VTT_DIR "debug.log"
 $HELPER_LOG = Join-Path $VTT_DIR "helper.log"
+$TRAY_LOG = Join-Path $VTT_DIR "tray.log"
 $HOTKEY_SCRIPT = Join-Path $PSScriptRoot "vtt-hotkey.ps1"
 $TRAY_SCRIPT = Join-Path $PSScriptRoot "vtt-tray.ps1"
 
@@ -168,6 +170,13 @@ switch ($Command.ToLower()) {
         } else {
             Write-Host "(no logs)"
         }
+        Write-Host ""
+        Write-Host "=== Tray Log ===" -ForegroundColor Cyan
+        if (Test-Path $TRAY_LOG) {
+            Get-Content $TRAY_LOG -Tail 20
+        } else {
+            Write-Host "(no tray logs)"
+        }
     }
     "tray" {
         Write-Host "Starting VTT tray..." -ForegroundColor Cyan
@@ -176,7 +185,20 @@ switch ($Command.ToLower()) {
             -WindowStyle Hidden
         Write-Host "Tray icon started (check the notification area)" -ForegroundColor Green
     }
+    "tray-stop" {
+        Write-Host "Stopping VTT tray..." -ForegroundColor Yellow
+        $trayProcs = Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%vtt-tray.ps1%'" -ErrorAction SilentlyContinue
+        if ($trayProcs) {
+            $trayProcs | ForEach-Object {
+                Write-Host "Killing tray process (PID $($_.ProcessId))..." -ForegroundColor Yellow
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "Tray stopped" -ForegroundColor Green
+        } else {
+            Write-Host "No tray process found" -ForegroundColor Gray
+        }
+    }
     default {
-        Write-Host "Usage: vtt [start|stop|restart|status|logs|tray]" -ForegroundColor Yellow
+        Write-Host "Usage: vtt [start|stop|restart|status|logs|tray|tray-stop]" -ForegroundColor Yellow
     }
 }
