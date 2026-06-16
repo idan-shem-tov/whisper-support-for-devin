@@ -103,10 +103,14 @@ powershell -ExecutionPolicy Bypass -File vtt.ps1 <command>
 
 ## How It Works
 
-- **Python daemon** (`vtt-helper.py`): Whisper model pre-loaded in memory, TCP server on localhost for instant IPC, 2-second audio pre-buffer (no clipped beginnings), auto-gain normalization, audio feedback sounds.
+- **Python daemon** (`vtt-helper.py`): Whisper model pre-loaded in memory, TCP server on localhost for instant IPC, on-demand microphone activation (mic only active during recording for privacy), auto-gain normalization, audio feedback sounds.
 - **PowerShell hotkey listener** (`vtt-hotkey.ps1`): Global hotkey via `WM_HOTKEY`, TCP client for daemon commands, auto-restart on daemon crash, clipboard paste via `keybd_event`.
 - **System tray UI** (`vtt-tray.ps1`): WinForms `NotifyIcon` with a single 3-second master timer. Status is cached to avoid redundant `Get-Process` calls; logs are only re-read when file modification times change. Single-instance enforced via a named Windows Mutex.
 - **Auto-start**: Registry `Run` key launches both the hotkey listener and the tray UI silently on login.
+
+### Privacy
+
+**The microphone is only activated when you press the hotkey to start recording.** When you press the hotkey again to stop, the microphone is immediately deactivated. This means Windows will only show Python using the microphone during active recording sessions, not continuously.
 
 ## Troubleshooting
 

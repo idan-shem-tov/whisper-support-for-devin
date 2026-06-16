@@ -136,32 +136,30 @@ def daemon():
 
     language = config["language"]
     device = pick_device()
-    pre_buffer_frames = PRE_BUFFER_SECS * RATE
-    ring = collections.deque(maxlen=pre_buffer_frames)
     recording_chunks = []
-    is_recording = False
     recording_start_time = [0.0]  # track when recording started
-    lock = threading.Lock()  # protects is_recording and recording_chunks
+    lock = threading.Lock()  # protects recording state and chunks
+    
+    # Audio stream state (only active when recording)
+    audio_stream = [None]  # holds the active InputStream or None
+    stream_lock = threading.Lock()  # protects audio_stream
 
     # Transcription state (background thread writes result here)
     transcription_result = [None]  # None=idle, "pending"=working, str=done
     transcription_lock = threading.Lock()
 
     def callback(indata, frames, time_info, status):
-        nonlocal is_recording
+        """Audio callback - only called when stream is active (during recording)."""
         samples = indata[:, 0].copy()
         with lock:
-            if is_recording:
-                # Safety cap: auto-stop after MAX_RECORDING_SECS
-                if time.time() - recording_start_time[0] > MAX_RECORDING_SECS:
-                    is_recording = False
-                    log(f"Recording auto-stopped after {MAX_RECORDING_SECS}s safety cap")
-                else:
-                    recording_chunks.append(samples)
+            # Safety cap: auto-stop after MAX_RECORDING_SECS
+            if time.time() - recording_start_time[0] > MAX_RECORDING_SECS:
+                log(f"Recording auto-stopped after {MAX_RECORDING_SECS}s safety cap")
+                # Stop will be handled by the next command
             else:
-                ring.extend(samples)
+                recording_chunks.append(samples)
 
-    log(f"Daemon starting, device={device}, pre-buffer={PRE_BUFFER_SECS}s")
+    log(f"Daemon starting, device={device} (mic will activate only when recording)")
 
     def do_transcribe_bg(wav_path):
         """Transcribe in background thread, store result."""
@@ -189,36 +187,62 @@ def daemon():
                 pass
 
     def handle_start():
-        """Handle 'start' command: begin recording."""
-        nonlocal is_recording
-        with lock:
-            if is_recording:
-                # Still provide feedback to the user if the hotkey state got out of sync
+        """Handle 'start' command: open audio stream and begin recording."""
+        with stream_lock:
+            if audio_stream[0] is not None:
+                # Already recording
                 if sound_enabled:
                     play_sound(SND_START)
                 log("Start requested but already recording")
                 return "already_recording"
+            
+            # Open the audio stream
+            try:
+                audio_stream[0] = sd.InputStream(
+                    samplerate=RATE, 
+                    channels=CHANNELS, 
+                    dtype="int16",
+                    callback=callback, 
+                    device=device
+                )
+                audio_stream[0].start()
+            except Exception as e:
+                log(f"ERROR: Failed to open audio stream: {e}")
+                audio_stream[0] = None
+                return "error"
+        
+        with lock:
             recording_chunks.clear()
-            recording_chunks.append(np.array(list(ring), dtype=np.int16))
-            is_recording = True
             recording_start_time[0] = time.time()
+        
         if sound_enabled:
             play_sound(SND_START)
-        log(f"Recording started (pre-buffer={len(ring)} samples)")
+        log("Recording started (microphone activated)")
         return "ok"
 
     def handle_stop():
-        """Handle 'stop' command: stop recording, start transcription in background."""
-        nonlocal is_recording
-        with lock:
-            if not is_recording:
+        """Handle 'stop' command: stop recording, close audio stream, start transcription in background."""
+        # Stop and close the audio stream
+        with stream_lock:
+            if audio_stream[0] is None:
+                # Not recording
                 return "ok"
-            is_recording = False
+            try:
+                audio_stream[0].stop()
+                audio_stream[0].close()
+            except Exception as e:
+                log(f"WARNING: Error closing audio stream: {e}")
+            finally:
+                audio_stream[0] = None
+        
+        with lock:
             chunks = list(recording_chunks)
             recording_chunks.clear()
 
         if sound_enabled:
             play_sound(SND_STOP)
+        
+        log("Recording stopped (microphone deactivated)")
 
         if not chunks:
             log("No audio captured")
@@ -230,7 +254,7 @@ def daemon():
         peak = int(np.max(np.abs(audio)))
         rms = float(np.sqrt(np.mean(audio.astype(float)**2)))
         duration = len(audio) / RATE
-        log(f"Recording stopped: {duration:.1f}s, peak={peak}, rms={rms:.0f}")
+        log(f"Audio captured: {duration:.1f}s, peak={peak}, rms={rms:.0f}")
 
         # Normalize audio
         if peak > 10:
@@ -289,42 +313,49 @@ def daemon():
         finally:
             conn.close()
 
-    # Start audio stream
-    with sd.InputStream(samplerate=RATE, channels=CHANNELS, dtype="int16",
-                        callback=callback, device=device):
+    # Start TCP server on a free port
+    # Note: Audio stream is now opened on-demand when recording starts
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(1)
+    srv.settimeout(1.0)  # accept timeout for clean shutdown
 
-        # Start TCP server on a free port
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        port = srv.getsockname()[1]
-        srv.listen(1)
-        srv.settimeout(1.0)  # accept timeout for clean shutdown
+    # Write port file (signals "ready" to the hotkey script)
+    with open(PORT_FILE, "w") as f:
+        f.write(str(port))
+    log(f"Daemon ready, listening on 127.0.0.1:{port}")
 
-        # Write port file (signals "ready" to the hotkey script)
-        with open(PORT_FILE, "w") as f:
-            f.write(str(port))
-        log(f"Daemon ready, listening on 127.0.0.1:{port}")
-
-        try:
-            while True:
-                try:
-                    conn, addr = srv.accept()
-                    handle_client(conn)
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    log(f"Accept error: {e}")
-                    time.sleep(0.1)
-        except Exception as e:
-            log(f"FATAL: Server error: {e}")
-            raise
-        finally:
-            srv.close()
+    try:
+        while True:
             try:
-                os.remove(PORT_FILE)
-            except Exception:
-                pass
+                conn, addr = srv.accept()
+                handle_client(conn)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                log(f"Accept error: {e}")
+                time.sleep(0.1)
+    except Exception as e:
+        log(f"FATAL: Server error: {e}")
+        raise
+    finally:
+        # Clean up: close any open audio stream
+        with stream_lock:
+            if audio_stream[0] is not None:
+                try:
+                    audio_stream[0].stop()
+                    audio_stream[0].close()
+                except Exception:
+                    pass
+                audio_stream[0] = None
+        
+        srv.close()
+        try:
+            os.remove(PORT_FILE)
+        except Exception:
+            pass
 
 
 def test_mic():
