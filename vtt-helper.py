@@ -66,7 +66,7 @@ def load_config():
     """Load all settings from config.ini. Returns a dict with keys:
     model (str), language (str or None), sound (bool).
     """
-    defaults = {"model": "base", "language": None, "sound": True, "device_index": None}
+    defaults = {"model": "base", "language": None, "sound": True}
 
     if not os.path.exists(CONFIG_FILE):
         log(f"No config.ini found at {CONFIG_FILE}, using defaults")
@@ -101,95 +101,110 @@ def load_config():
     result["sound"] = val in ("on", "true", "yes", "1")
     log(f"Config: sound={'on' if result['sound'] else 'off'}")
 
-    # Device index (optional override)
-    val = cfg.get("vtt", "device_index", fallback="").strip()
-    if val:
-        try:
-            result["device_index"] = int(val)
-            log(f"Config: device_index={result['device_index']}")
-        except ValueError:
-            log(f"WARNING: Invalid device_index '{val}', ignoring")
-
     return result
 
 
-def pick_device(config=None):
-    """Auto-detect the best input device, or use config override.
+def pick_device():
+    """Auto-detect the active microphone by sampling real audio signal.
 
-    Priority rules (higher score wins):
-      - Config device_index override: always wins (score=1000)
-      - Preferred API: MME (+20), Windows DirectSound (+10), WASAPI (+5)
-      - Preferred names (real mics, highest to lowest):
-          'Microphone Array'  (+30)  -- Intel Smart Sound / laptop array mic
-          'Microphone'        (+20)  -- generic USB or built-in mic
-          'Headset'           (+15)  -- headset mic
-          'Line In' / 'Aux'   (+5)   -- line input (real but less preferred)
-      - Penalised names (virtual/loopback devices):
-          'Stereo Mix'/'What U Hear'/'Loopback'/'Virtual'/'VB-'/'Voicemeeter' (-50)
-      - System default device: +5 tie-breaker
+    Works like Teams/Zoom: briefly records from every candidate input device
+    and picks the one with the highest RMS signal level.
+
+    Strategy:
+      1. Enumerate all input devices, skipping known loopback/virtual ones.
+      2. Prefer MME API (most compatible with Whisper/sounddevice on Windows);
+         deduplicate by name so each physical mic is only tested once.
+      3. Record SAMPLE_SECS of audio from each candidate in parallel threads.
+      4. Pick the device with the highest RMS. If all are silent (rms==0),
+         fall back to the OS default input device.
     """
-    # Config override takes priority
-    if config:
-        idx = config.get("device_index")
-        if idx is not None:
-            log(f"Using config device_index={idx}")
-            return idx
+    SAMPLE_SECS = 0.3          # how long to record from each device (seconds)
+    SAMPLE_RATE = 16000
+    # Known loopback / virtual device name fragments — never real mics
+    LOOPBACK_NAMES = [
+        "stereo mix", "what u hear", "wave out", "loopback",
+        "virtual", "vb-", "voicemeeter", "output",
+    ]
+    # Preferred API order for deduplication (index = priority, lower = better)
+    API_PREF = ["MME", "Windows DirectSound", "Windows WASAPI"]
 
     devices = sd.query_devices()
     default_in = sd.default.device[0]
 
-    # Scoring weights
-    API_SCORES = {"MME": 20, "Windows DirectSound": 10, "Windows WASAPI": 5}
-    GOOD_NAMES = [
-        ("Microphone Array", 30),
-        ("Microphone",       20),
-        ("Headset",          15),
-        ("Line In",           5),
-        ("Aux",               5),
-    ]
-    BAD_NAMES = ["Stereo Mix", "What U Hear", "Loopback", "Virtual", "VB-", "Voicemeeter", "Wave Out"]
-
-    log("Available input devices:")
-    scored = []
+    # --- Build candidate list ---
+    # Key by lowercase name so each physical mic appears once (best API wins).
+    candidates = {}  # name_key -> (device_index, api_name, display_name)
     for i, d in enumerate(devices):
         if d['max_input_channels'] < 1:
             continue
         api_name = sd.query_hostapis(d['hostapi'])['name']
         name = d['name']
-
-        score = 0
-        score += API_SCORES.get(api_name, 0)
-
         name_lower = name.lower()
-        for bad in BAD_NAMES:
-            if bad.lower() in name_lower:
-                score -= 50
-                break
-        else:
-            for good, pts in GOOD_NAMES:
-                if good.lower() in name_lower:
-                    score += pts
-                    break
 
-        if i == default_in:
-            score += 5  # tie-breaker: prefer the OS default
+        # Skip loopback/virtual
+        if any(bad in name_lower for bad in LOOPBACK_NAMES):
+            continue
 
-        log(f"  [{i:2d}] score={score:+d}  {api_name}: {name}")
-        scored.append((score, i))
+        # Deduplicate: keep entry with best (lowest index) API preference
+        pref = API_PREF.index(api_name) if api_name in API_PREF else len(API_PREF)
+        key = name_lower
+        if key not in candidates or pref < candidates[key][3]:
+            candidates[key] = (i, api_name, name, pref)
 
-    if not scored:
-        log("WARNING: No input devices found, using system default")
+    candidate_list = [(idx, api, name) for (idx, api, name, _) in candidates.values()]
+
+    log(f"Sampling {len(candidate_list)} input device(s) to find the active mic...")
+
+    # --- Sample each device in parallel ---
+    results = {}  # device_index -> rms
+
+    def sample_device(idx, name):
+        try:
+            frames = int(SAMPLE_RATE * SAMPLE_SECS)
+            audio = sd.rec(frames, samplerate=SAMPLE_RATE, channels=1,
+                           dtype="int16", device=idx)
+            sd.wait()
+            rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+            results[idx] = rms
+        except Exception as e:
+            results[idx] = 0.0
+            log(f"  [{idx}] {name}: sample error — {e}")
+
+    threads = []
+    for idx, api, name in candidate_list:
+        t = threading.Thread(target=sample_device, args=(idx, name), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=SAMPLE_SECS + 2)
+
+    # --- Log results and pick winner ---
+    log("Input device signal levels:")
+    for idx, api, name in sorted(candidate_list, key=lambda x: x[0]):
+        rms = results.get(idx, 0.0)
+        log(f"  [{idx:2d}] rms={rms:7.1f}  {api}: {name}")
+
+    if not results:
+        log(f"WARNING: Could not sample any device, falling back to OS default ({default_in})")
         return default_in
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_idx = scored[0]
+    best_idx = max(results, key=results.get)
+    best_rms = results[best_idx]
     best_name = devices[best_idx]['name']
     best_api  = sd.query_hostapis(devices[best_idx]['hostapi'])['name']
 
-    if best_score < 0:
-        log(f"WARNING: Best device has negative score ({best_score}) — all devices look like virtual/loopback. "
-            f"Set device_index in config.ini to override.")
-    log(f"Auto-selected device {best_idx}: {best_name} ({best_api}, score={best_score:+d})")
+    if best_rms == 0.0:
+        # All devices returned silence — could be a quiet room; still pick the
+        # highest-ranked candidate by API preference rather than a random default.
+        log("WARNING: All devices returned silence during sampling (quiet room or mic muted?). "
+            "Picking best candidate by API preference.")
+        # Sort by API preference then by device index
+        candidate_list.sort(key=lambda x: (API_PREF.index(x[1]) if x[1] in API_PREF else 99, x[0]))
+        best_idx = candidate_list[0][0]
+        best_name = devices[best_idx]['name']
+        best_api  = sd.query_hostapis(devices[best_idx]['hostapi'])['name']
+
+    log(f"Auto-selected device {best_idx}: {best_name} ({best_api}, rms={results.get(best_idx, 0):.1f})")
     return best_idx
 
 
@@ -210,7 +225,7 @@ def daemon():
     log("Model loaded")
 
     language = config["language"]
-    device = pick_device(config)
+    device = pick_device()
     recording_chunks = []
     recording_start_time = [0.0]  # track when recording started
     lock = threading.Lock()  # protects recording state and chunks
