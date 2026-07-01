@@ -66,7 +66,7 @@ def load_config():
     """Load all settings from config.ini. Returns a dict with keys:
     model (str), language (str or None), sound (bool).
     """
-    defaults = {"model": "base", "language": None, "sound": True}
+    defaults = {"model": "base", "language": None, "sound": True, "device_index": None}
 
     if not os.path.exists(CONFIG_FILE):
         log(f"No config.ini found at {CONFIG_FILE}, using defaults")
@@ -101,21 +101,96 @@ def load_config():
     result["sound"] = val in ("on", "true", "yes", "1")
     log(f"Config: sound={'on' if result['sound'] else 'off'}")
 
+    # Device index (optional override)
+    val = cfg.get("vtt", "device_index", fallback="").strip()
+    if val:
+        try:
+            result["device_index"] = int(val)
+            log(f"Config: device_index={result['device_index']}")
+        except ValueError:
+            log(f"WARNING: Invalid device_index '{val}', ignoring")
+
     return result
 
 
-def pick_device():
-    """Auto-detect the best input device."""
-    devices = sd.query_devices()
-    for i, d in enumerate(devices):
-        api_name = sd.query_hostapis(d['hostapi'])['name']
-        if 'Microphone Array' in d['name'] and 'MME' in api_name:
-            log(f"Auto-selected device {i}: {d['name']}")
-            return i
+def pick_device(config=None):
+    """Auto-detect the best input device, or use config override.
 
-    device = sd.default.device[0]
-    log(f"Using default input device {device}")
-    return device
+    Priority rules (higher score wins):
+      - Config device_index override: always wins (score=1000)
+      - Preferred API: MME (+20), Windows DirectSound (+10), WASAPI (+5)
+      - Preferred names (real mics, highest to lowest):
+          'Microphone Array'  (+30)  -- Intel Smart Sound / laptop array mic
+          'Microphone'        (+20)  -- generic USB or built-in mic
+          'Headset'           (+15)  -- headset mic
+          'Line In' / 'Aux'   (+5)   -- line input (real but less preferred)
+      - Penalised names (virtual/loopback devices):
+          'Stereo Mix'/'What U Hear'/'Loopback'/'Virtual'/'VB-'/'Voicemeeter' (-50)
+      - System default device: +5 tie-breaker
+    """
+    # Config override takes priority
+    if config:
+        idx = config.get("device_index")
+        if idx is not None:
+            log(f"Using config device_index={idx}")
+            return idx
+
+    devices = sd.query_devices()
+    default_in = sd.default.device[0]
+
+    # Scoring weights
+    API_SCORES = {"MME": 20, "Windows DirectSound": 10, "Windows WASAPI": 5}
+    GOOD_NAMES = [
+        ("Microphone Array", 30),
+        ("Microphone",       20),
+        ("Headset",          15),
+        ("Line In",           5),
+        ("Aux",               5),
+    ]
+    BAD_NAMES = ["Stereo Mix", "What U Hear", "Loopback", "Virtual", "VB-", "Voicemeeter", "Wave Out"]
+
+    log("Available input devices:")
+    scored = []
+    for i, d in enumerate(devices):
+        if d['max_input_channels'] < 1:
+            continue
+        api_name = sd.query_hostapis(d['hostapi'])['name']
+        name = d['name']
+
+        score = 0
+        score += API_SCORES.get(api_name, 0)
+
+        name_lower = name.lower()
+        for bad in BAD_NAMES:
+            if bad.lower() in name_lower:
+                score -= 50
+                break
+        else:
+            for good, pts in GOOD_NAMES:
+                if good.lower() in name_lower:
+                    score += pts
+                    break
+
+        if i == default_in:
+            score += 5  # tie-breaker: prefer the OS default
+
+        log(f"  [{i:2d}] score={score:+d}  {api_name}: {name}")
+        scored.append((score, i))
+
+    if not scored:
+        log("WARNING: No input devices found, using system default")
+        return default_in
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_idx = scored[0]
+    best_name = devices[best_idx]['name']
+    best_api  = sd.query_hostapis(devices[best_idx]['hostapi'])['name']
+
+    if best_score < 0:
+        log(f"WARNING: Best device has negative score ({best_score}) — all devices look like virtual/loopback. "
+            f"Set device_index in config.ini to override.")
+    log(f"Auto-selected device {best_idx}: {best_name} ({best_api}, score={best_score:+d})")
+    return best_idx
 
 
 def daemon():
@@ -135,7 +210,7 @@ def daemon():
     log("Model loaded")
 
     language = config["language"]
-    device = pick_device()
+    device = pick_device(config)
     recording_chunks = []
     recording_start_time = [0.0]  # track when recording started
     lock = threading.Lock()  # protects recording state and chunks
@@ -256,13 +331,15 @@ def daemon():
         duration = len(audio) / RATE
         log(f"Audio captured: {duration:.1f}s, peak={peak}, rms={rms:.0f}")
 
-        # Normalize audio
-        if peak > 10:
+        # Normalize audio (apply gain if signal is present but quiet)
+        if peak > 0:
             target = 26000
             gain = min(target / peak, 200)
             audio_float = audio.astype(np.float64) * gain
             audio = np.clip(audio_float, -32767, 32767).astype(np.int16)
-            log(f"Applied {gain:.1f}x gain")
+            log(f"Applied {gain:.1f}x gain (peak was {peak})")
+        else:
+            log("WARNING: peak=0, no audio signal at all — check microphone device")
 
         # Save wav and start background transcription
         wav.write(WAV_PATH, RATE, audio)
