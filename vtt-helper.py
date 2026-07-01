@@ -105,106 +105,84 @@ def load_config():
 
 
 def pick_device():
-    """Auto-detect the active microphone by sampling real audio signal.
+    """Select the active Windows input device — the same one shown in
+    Windows Settings > Sound > Input.
 
-    Works like Teams/Zoom: briefly records from every candidate input device
-    and picks the one with the highest RMS signal level.
-
-    Strategy:
-      1. Enumerate all input devices, skipping known loopback/virtual ones.
-      2. Prefer MME API (most compatible with Whisper/sounddevice on Windows);
-         deduplicate by name so each physical mic is only tested once.
-      3. Record SAMPLE_SECS of audio from each candidate in parallel threads.
-      4. Pick the device with the highest RMS. If all are silent (rms==0),
-         fall back to the OS default input device.
+    Strategy (mimics how Teams/Zoom work):
+      1. Only consider MME devices — this is the API that PortAudio/sounddevice
+         uses reliably on Windows. WDM-KS and DirectSound give misleading RMS
+         readings and break during actual recording, so they are excluded.
+      2. Filter out known loopback/virtual devices (Stereo Mix, VB-, etc.).
+      3. Among the real MME mics, sample each one briefly and pick the one
+         with the highest RMS signal.
+      4. If all MME mics read silence (quiet room / mic muted), fall back to
+         the MME Sound Mapper (device 0) which is exactly what Windows Sound
+         Settings controls — it always follows the user's chosen default.
     """
-    SAMPLE_SECS = 0.3          # how long to record from each device (seconds)
+    SAMPLE_SECS = 0.4
     SAMPLE_RATE = 16000
-    # Known loopback / virtual device name fragments — never real mics
     LOOPBACK_NAMES = [
         "stereo mix", "what u hear", "wave out", "loopback",
-        "virtual", "vb-", "voicemeeter", "output",
+        "virtual", "vb-", "voicemeeter",
     ]
-    # Preferred API order for deduplication (index = priority, lower = better)
-    API_PREF = ["MME", "Windows DirectSound", "Windows WASAPI"]
 
     devices = sd.query_devices()
-    default_in = sd.default.device[0]
 
-    # --- Build candidate list ---
-    # Key by lowercase name so each physical mic appears once (best API wins).
-    candidates = {}  # name_key -> (device_index, api_name, display_name)
+    # --- Collect MME input devices only ---
+    mme_inputs = []
     for i, d in enumerate(devices):
         if d['max_input_channels'] < 1:
             continue
         api_name = sd.query_hostapis(d['hostapi'])['name']
-        name = d['name']
-        name_lower = name.lower()
-
-        # Skip loopback/virtual
-        if any(bad in name_lower for bad in LOOPBACK_NAMES):
+        if api_name != "MME":
             continue
+        if any(bad in d['name'].lower() for bad in LOOPBACK_NAMES):
+            continue
+        mme_inputs.append((i, d['name']))
 
-        # Deduplicate: keep entry with best (lowest index) API preference
-        pref = API_PREF.index(api_name) if api_name in API_PREF else len(API_PREF)
-        key = name_lower
-        if key not in candidates or pref < candidates[key][3]:
-            candidates[key] = (i, api_name, name, pref)
+    if not mme_inputs:
+        log("WARNING: No MME input devices found, using sounddevice default")
+        return sd.default.device[0]
 
-    candidate_list = [(idx, api, name) for (idx, api, name, _) in candidates.values()]
+    log(f"Sampling {len(mme_inputs)} MME input device(s)...")
 
-    log(f"Sampling {len(candidate_list)} input device(s) to find the active mic...")
+    # --- Sample in parallel ---
+    results = {}  # index -> rms
 
-    # --- Sample each device in parallel ---
-    results = {}  # device_index -> rms
-
-    def sample_device(idx, name):
+    def sample(idx, name):
         try:
             frames = int(SAMPLE_RATE * SAMPLE_SECS)
             audio = sd.rec(frames, samplerate=SAMPLE_RATE, channels=1,
                            dtype="int16", device=idx)
             sd.wait()
-            rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
-            results[idx] = rms
+            results[idx] = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
         except Exception as e:
             results[idx] = 0.0
             log(f"  [{idx}] {name}: sample error — {e}")
 
-    threads = []
-    for idx, api, name in candidate_list:
-        t = threading.Thread(target=sample_device, args=(idx, name), daemon=True)
+    threads = [threading.Thread(target=sample, args=(i, n), daemon=True)
+               for i, n in mme_inputs]
+    for t in threads:
         t.start()
-        threads.append(t)
     for t in threads:
         t.join(timeout=SAMPLE_SECS + 2)
 
-    # --- Log results and pick winner ---
-    log("Input device signal levels:")
-    for idx, api, name in sorted(candidate_list, key=lambda x: x[0]):
-        rms = results.get(idx, 0.0)
-        log(f"  [{idx:2d}] rms={rms:7.1f}  {api}: {name}")
+    # --- Log and pick ---
+    log("MME input device signal levels:")
+    for idx, name in mme_inputs:
+        log(f"  [{idx:2d}] rms={results.get(idx, 0):7.1f}  {name}")
 
-    if not results:
-        log(f"WARNING: Could not sample any device, falling back to OS default ({default_in})")
-        return default_in
+    best_idx = max(results, key=results.get) if results else None
+    best_rms = results.get(best_idx, 0) if best_idx is not None else 0
 
-    best_idx = max(results, key=results.get)
-    best_rms = results[best_idx]
-    best_name = devices[best_idx]['name']
-    best_api  = sd.query_hostapis(devices[best_idx]['hostapi'])['name']
+    if best_rms == 0.0 or best_idx is None:
+        # Quiet room or all muted — use the Sound Mapper (follows Windows default)
+        mapper = next((i for i, n in mme_inputs if "sound mapper" in n.lower()), mme_inputs[0][0])
+        log(f"All mics silent during sampling — using Sound Mapper (device {mapper}). "
+            f"This follows your Windows Sound Settings default input.")
+        return mapper
 
-    if best_rms == 0.0:
-        # All devices returned silence — could be a quiet room; still pick the
-        # highest-ranked candidate by API preference rather than a random default.
-        log("WARNING: All devices returned silence during sampling (quiet room or mic muted?). "
-            "Picking best candidate by API preference.")
-        # Sort by API preference then by device index
-        candidate_list.sort(key=lambda x: (API_PREF.index(x[1]) if x[1] in API_PREF else 99, x[0]))
-        best_idx = candidate_list[0][0]
-        best_name = devices[best_idx]['name']
-        best_api  = sd.query_hostapis(devices[best_idx]['hostapi'])['name']
-
-    log(f"Auto-selected device {best_idx}: {best_name} ({best_api}, rms={results.get(best_idx, 0):.1f})")
+    log(f"Auto-selected device {best_idx}: {devices[best_idx]['name']} (rms={best_rms:.1f})")
     return best_idx
 
 
