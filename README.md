@@ -103,10 +103,27 @@ powershell -ExecutionPolicy Bypass -File vtt.ps1 <command>
 
 ## How It Works
 
-- **Python daemon** (`vtt-helper.py`): Whisper model pre-loaded in memory, TCP server on localhost for instant IPC, on-demand microphone activation (mic only active during recording for privacy), auto-gain normalization, audio feedback sounds.
+- **Python daemon** (`vtt-helper.py`): Whisper model pre-loaded in memory, TCP server on localhost for instant IPC, on-demand microphone activation (mic only active during recording for privacy), auto-gain normalization, audio feedback sounds, **automatic GPU detection with CPU fallback**.
 - **PowerShell hotkey listener** (`vtt-hotkey.ps1`): Global hotkey via `WM_HOTKEY`, TCP client for daemon commands, auto-restart on daemon crash, clipboard paste via `keybd_event`.
 - **System tray UI** (`vtt-tray.ps1`): WinForms `NotifyIcon` with a single 3-second master timer. Status is cached to avoid redundant `Get-Process` calls; logs are only re-read when file modification times change. Single-instance enforced via a named Windows Mutex.
 - **Auto-start**: Registry `Run` key launches both the hotkey listener and the tray UI silently on login.
+
+### GPU Acceleration
+
+VTT automatically detects and uses your NVIDIA GPU (via CUDA) if available, providing **3-10x faster transcription**.
+
+**Setup** (automatic during install):
+- The installer automatically downloads CUDA libraries (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`)
+- No manual CUDA Toolkit installation required
+- Works with any NVIDIA GPU that supports CUDA
+
+**Fallback system**:
+1. **Startup fallback**: If GPU detection fails or model loading fails, falls back to CPU
+2. **Runtime fallback**: If GPU transcription fails, automatically reloads model on CPU and retries
+
+Check `helper.log` after startup to see which device is being used:
+- `Model loaded successfully on cuda` = GPU active
+- `Model loaded successfully on cpu` = CPU fallback
 
 ### Privacy
 

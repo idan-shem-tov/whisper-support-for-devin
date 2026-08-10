@@ -32,7 +32,16 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "  ERROR: pip install failed. Try running as administrator." -ForegroundColor Red
     exit 1
 }
-Write-Host "  Dependencies installed" -ForegroundColor Green
+Write-Host "  Core dependencies installed" -ForegroundColor Green
+
+# Install CUDA libraries for GPU acceleration (optional, fails gracefully)
+Write-Host "  Installing CUDA libraries for GPU support..." -ForegroundColor Gray
+& python -m pip install --quiet nvidia-cublas-cu12 nvidia-cudnn-cu12 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "  GPU support enabled (CUDA libraries installed)" -ForegroundColor Green
+} else {
+    Write-Host "  GPU libraries not installed (will use CPU)" -ForegroundColor Yellow
+}
 
 # --- 3. Configure paths in vtt-hotkey.ps1 ---
 Write-Host "[3/6] Configuring paths..." -ForegroundColor Yellow

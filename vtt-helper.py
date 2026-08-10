@@ -16,6 +16,32 @@ import numpy as np
 import sounddevice as sd
 import scipy.io.wavfile as wav
 
+# Add NVIDIA CUDA library paths to DLL search path (for GPU support)
+def add_cuda_to_path():
+    """Add NVIDIA CUDA library directories to the DLL search path."""
+    try:
+        import nvidia.cublas
+        import nvidia.cudnn
+        cublas_path = os.path.join(os.path.dirname(nvidia.cublas.__path__[0]), 'cublas', 'bin')
+        cudnn_path = os.path.join(os.path.dirname(nvidia.cudnn.__path__[0]), 'cudnn', 'bin')
+        
+        # Add to PATH environment variable
+        if os.path.exists(cublas_path):
+            os.environ['PATH'] = cublas_path + os.pathsep + os.environ.get('PATH', '')
+        if os.path.exists(cudnn_path):
+            os.environ['PATH'] = cudnn_path + os.pathsep + os.environ.get('PATH', '')
+            
+        # Also add to DLL search path (Windows 10+)
+        if hasattr(os, 'add_dll_directory'):
+            if os.path.exists(cublas_path):
+                os.add_dll_directory(cublas_path)
+            if os.path.exists(cudnn_path):
+                os.add_dll_directory(cudnn_path)
+    except (ImportError, AttributeError, IndexError):
+        pass  # CUDA libraries not installed, will use CPU
+
+add_cuda_to_path()
+
 VTT_DIR = os.path.join(os.environ.get("TEMP", r"C:\Temp"), "vtt")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.ini")
@@ -186,6 +212,32 @@ def pick_device():
     return best_idx
 
 
+def detect_device():
+    """Detect the best available device (CUDA GPU or CPU) for inference.
+    Returns a tuple: (device, compute_type)
+    """
+    try:
+        import ctranslate2
+        cuda_count = ctranslate2.get_cuda_device_count()
+        if cuda_count > 0:
+            supported = ctranslate2.get_supported_compute_types("cuda")
+            # Prefer float16 for best balance of speed and accuracy on GPU
+            if "float16" in supported:
+                log(f"CUDA GPU detected ({cuda_count} device(s)), using device=cuda, compute_type=float16")
+                return ("cuda", "float16")
+            elif "int8_float16" in supported:
+                log(f"CUDA GPU detected ({cuda_count} device(s)), using device=cuda, compute_type=int8_float16")
+                return ("cuda", "int8_float16")
+            else:
+                log(f"CUDA GPU detected but no optimal compute type found, falling back to CPU")
+                return ("cpu", "int8")
+    except Exception as e:
+        log(f"GPU detection failed: {e}, falling back to CPU")
+    
+    log("Using device=cpu, compute_type=int8")
+    return ("cpu", "int8")
+
+
 def daemon():
     """Run as daemon: record with pre-buffer, transcribe with pre-loaded model.
     Uses a TCP server on localhost for IPC with the hotkey script.
@@ -195,12 +247,28 @@ def daemon():
     config = load_config()
     sound_enabled = config["sound"]
 
+    # Detect best device (GPU with CUDA or CPU fallback)
+    device_type, compute_type = detect_device()
+
     # Pre-load the whisper model
     model_name = config["model"]
-    log(f"Loading whisper model ({model_name})...")
+    current_device = [device_type]
+    log(f"Loading whisper model ({model_name}) on {device_type} with {compute_type}...")
     from faster_whisper import WhisperModel
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
-    log("Model loaded")
+    try:
+        model = WhisperModel(model_name, device=device_type, compute_type=compute_type)
+        log(f"Model loaded successfully on {device_type}")
+    except Exception as e:
+        log(f"WARNING: Failed to load model on {device_type}: {e}")
+        if device_type != "cpu":
+            log("Falling back to CPU...")
+            device_type = "cpu"
+            compute_type = "int8"
+            current_device[0] = device_type
+            model = WhisperModel(model_name, device=device_type, compute_type=compute_type)
+            log("Model loaded successfully on cpu (fallback)")
+        else:
+            raise
 
     language = config["language"]
     device = pick_device()
@@ -216,6 +284,9 @@ def daemon():
     transcription_result = [None]  # None=idle, "pending"=working, str=done
     transcription_lock = threading.Lock()
 
+    # Model state for runtime fallback
+    model_lock = threading.Lock()
+
     def callback(indata, frames, time_info, status):
         """Audio callback - only called when stream is active (during recording)."""
         samples = indata[:, 0].copy()
@@ -230,21 +301,48 @@ def daemon():
     log(f"Daemon starting, device={device} (mic will activate only when recording)")
 
     def do_transcribe_bg(wav_path):
-        """Transcribe in background thread, store result."""
+        """Transcribe in background thread, store result.
+        Falls back to CPU if GPU transcription fails (e.g. missing CUDA libraries).
+        """
+        nonlocal model
         text = ""
         try:
             kwargs = {"beam_size": 5}
             if language:
                 kwargs["language"] = language
-            segments, info = model.transcribe(wav_path, **kwargs)
+            with model_lock:
+                segments, info = model.transcribe(wav_path, **kwargs)
             text = " ".join(s.text.strip() for s in segments)
             lang = info.language if info else "?"
             log(f"Transcribed ({lang}): [{text}]")
         except Exception as e:
-            try:
-                log(f"ERROR: Transcription failed: {e}")
-            except Exception:
-                pass  # log() itself failed, but we still have text if it was set
+            error_str = str(e)
+            if current_device[0] != "cpu" and (
+                "cublas" in error_str.lower()
+                or "cudnn" in error_str.lower()
+                or "cuda" in error_str.lower()
+                or "library" in error_str.lower()
+                or "could not load" in error_str.lower()
+                or "not found" in error_str.lower()
+            ):
+                log(f"GPU transcription failed ({e}), attempting CPU fallback...")
+                try:
+                    with model_lock:
+                        log("Reloading Whisper model on CPU...")
+                        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+                        current_device[0] = "cpu"
+                        log("Model reloaded on CPU, retrying transcription")
+                        segments, info = model.transcribe(wav_path, **kwargs)
+                        text = " ".join(s.text.strip() for s in segments)
+                    lang = info.language if info else "?"
+                    log(f"Transcribed on CPU fallback ({lang}): [{text}]")
+                except Exception as e2:
+                    log(f"ERROR: CPU fallback transcription also failed: {e2}")
+            else:
+                try:
+                    log(f"ERROR: Transcription failed: {e}")
+                except Exception:
+                    pass
         finally:
             # ALWAYS set the result so PS side never gets stuck on "pending"
             with transcription_lock:
