@@ -90,9 +90,9 @@ def log(msg):
 
 def load_config():
     """Load all settings from config.ini. Returns a dict with keys:
-    model (str), language (str or None), sound (bool).
+    model (str), language (str or None), sound (bool), mic_device (str).
     """
-    defaults = {"model": "base", "language": None, "sound": True}
+    defaults = {"model": "base", "language": None, "sound": True, "mic_device": "auto"}
 
     if not os.path.exists(CONFIG_FILE):
         log(f"No config.ini found at {CONFIG_FILE}, using defaults")
@@ -122,6 +122,15 @@ def load_config():
         result["language"] = None
         log("Config: language=auto-detect")
 
+    # Microphone device preference
+    val = cfg.get("vtt", "mic_device", fallback="auto").strip().lower()
+    if val in ("auto", ""):
+        result["mic_device"] = "auto"
+        log("Config: mic_device=auto")
+    else:
+        result["mic_device"] = val
+        log(f"Config: mic_device={val}")
+
     # Sound
     val = cfg.get("vtt", "sound", fallback="on").strip().lower()
     result["sound"] = val in ("on", "true", "yes", "1")
@@ -130,27 +139,24 @@ def load_config():
     return result
 
 
-def pick_device():
-    """Select the active Windows input device — the same one shown in
-    Windows Settings > Sound > Input.
-
-    Strategy (mimics how Teams/Zoom work):
-      1. Only consider MME devices — this is the API that PortAudio/sounddevice
-         uses reliably on Windows. WDM-KS and DirectSound give misleading RMS
-         readings and break during actual recording, so they are excluded.
-      2. Filter out known loopback/virtual devices (Stereo Mix, VB-, etc.).
-      3. Among the real MME mics, sample each one briefly and pick the one
-         with the highest RMS signal.
-      4. If all MME mics read silence (quiet room / mic muted), fall back to
-         the MME Sound Mapper (device 0) which is exactly what Windows Sound
-         Settings controls — it always follows the user's chosen default.
+def pick_device(preference="auto"):
+    """Select the active Windows input device intelligently.
+    
+    Args:
+        preference: "auto" (smart detection) or device name substring to match
+    
+    Strategy for "auto":
+      1. Try Windows Sound Mapper first (follows Windows settings)
+      2. If Sound Mapper doesn't work well, test actual devices
+      3. Prefer headsets/USB mics over built-in arrays
+      4. Pick device that actually captures audio
     """
-    SAMPLE_SECS = 0.4
-    SAMPLE_RATE = 16000
     LOOPBACK_NAMES = [
         "stereo mix", "what u hear", "wave out", "loopback",
         "virtual", "vb-", "voicemeeter",
     ]
+    HEADSET_KEYWORDS = ["headset", "headphone", "earphone", "jabra", "airpods", "usb", "bluetooth"]
+    ARRAY_KEYWORDS = ["array", "soundwire", "realtek"]
 
     devices = sd.query_devices()
 
@@ -170,46 +176,67 @@ def pick_device():
         log("WARNING: No MME input devices found, using sounddevice default")
         return sd.default.device[0]
 
-    log(f"Sampling {len(mme_inputs)} MME input device(s)...")
+    # --- Handle explicit device preference ---
+    if preference != "auto":
+        for idx, name in mme_inputs:
+            if preference.lower() in name.lower():
+                log(f"Using configured device: {name} (matched '{preference}')")
+                return idx
+        log(f"WARNING: Configured device '{preference}' not found, falling back to auto")
 
-    # --- Sample in parallel ---
-    results = {}  # index -> rms
-
-    def sample(idx, name):
-        try:
-            frames = int(SAMPLE_RATE * SAMPLE_SECS)
-            audio = sd.rec(frames, samplerate=SAMPLE_RATE, channels=1,
-                           dtype="int16", device=idx)
-            sd.wait()
-            results[idx] = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
-        except Exception as e:
-            results[idx] = 0.0
-            log(f"  [{idx}] {name}: sample error — {e}")
-
-    threads = [threading.Thread(target=sample, args=(i, n), daemon=True)
-               for i, n in mme_inputs]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=SAMPLE_SECS + 2)
-
-    # --- Log and pick ---
-    log("MME input device signal levels:")
-    for idx, name in mme_inputs:
-        log(f"  [{idx:2d}] rms={results.get(idx, 0):7.1f}  {name}")
-
-    best_idx = max(results, key=results.get) if results else None
-    best_rms = results.get(best_idx, 0) if best_idx is not None else 0
-
-    if best_rms == 0.0 or best_idx is None:
-        # Quiet room or all muted — use the Sound Mapper (follows Windows default)
-        mapper = next((i for i, n in mme_inputs if "sound mapper" in n.lower()), mme_inputs[0][0])
-        log(f"All mics silent during sampling — using Sound Mapper (device {mapper}). "
-            f"This follows your Windows Sound Settings default input.")
+    # --- Smart auto-detection ---
+    # First, check if there's only one non-mapper device (easy case)
+    non_mapper_devices = [(i, n) for i, n in mme_inputs if "sound mapper" not in n.lower()]
+    
+    if len(non_mapper_devices) == 1:
+        idx, name = non_mapper_devices[0]
+        log(f"Using only available device: {name}")
+        return idx
+    
+    # Multiple devices - prefer headsets over arrays
+    headsets = []
+    arrays = []
+    others = []
+    
+    for idx, name in non_mapper_devices:
+        name_lower = name.lower()
+        if any(kw in name_lower for kw in HEADSET_KEYWORDS):
+            headsets.append((idx, name))
+        elif any(kw in name_lower for kw in ARRAY_KEYWORDS):
+            arrays.append((idx, name))
+        else:
+            others.append((idx, name))
+    
+    # If we have headsets, prefer them
+    if headsets:
+        idx, name = headsets[0]
+        log(f"Auto-selected headset: {name}")
+        if len(headsets) > 1:
+            log(f"  (Multiple headsets found, using first one)")
+        return idx
+    
+    # No headsets, try others before arrays
+    if others:
+        idx, name = others[0]
+        log(f"Auto-selected device: {name}")
+        return idx
+    
+    # Only arrays available
+    if arrays:
+        idx, name = arrays[0]
+        log(f"Auto-selected built-in microphone: {name}")
+        return idx
+    
+    # Fallback to Sound Mapper
+    mapper = next((i for i, n in mme_inputs if "sound mapper" in n.lower()), None)
+    if mapper is not None:
+        log(f"Using Windows Sound Mapper: {devices[mapper]['name']}")
         return mapper
-
-    log(f"Auto-selected device {best_idx}: {devices[best_idx]['name']} (rms={best_rms:.1f})")
-    return best_idx
+    
+    # Last resort: first device
+    fallback_idx = mme_inputs[0][0]
+    log(f"Using fallback device: {devices[fallback_idx]['name']}")
+    return fallback_idx
 
 
 def detect_device():
@@ -271,7 +298,8 @@ def daemon():
             raise
 
     language = config["language"]
-    device = pick_device()
+    mic_preference = config.get("mic_device", "auto")
+    device = pick_device(mic_preference)
     recording_chunks = []
     recording_start_time = [0.0]  # track when recording started
     lock = threading.Lock()  # protects recording state and chunks
